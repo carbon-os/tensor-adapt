@@ -134,11 +134,35 @@ tensor-adapt/
 │                     no dependency on backend — no compute, no platform headers
 │                     shared format support with tensor-inference
 │
-├── base/           — base model loading and architecture detection (read-only)
-│                     loads any supported model from safetensors or GGUF
-│                     detects architecture from config.json
-│                     freezes all weights — no gradient tracking
-│                     exposes layer targets for adapter injection
+│                     parser/ knows about FILE FORMATS only.
+│                     it does not know what a layer is, what attention is,
+│                     or what any weight tensor means. that lives in base/arch/.
+│
+├── base/           — base model loading, architecture dispatch, frozen forward pass
+│   │
+│   ├── base_loader.hpp     — load(path, device) → FrozenBase
+│   │                         reads config.json via parser/, detects architecture,
+│   │                         dispatches to the correct arch/ implementation
+│   │
+│   ├── frozen_base.hpp     — frozen weights, architecture info,
+│   │                         layer target enumeration, base_sha
+│   │
+│   └── arch/               — one implementation per model family
+│       │                     each arch defines its own layer structure,
+│       │                     attention variant, FFN layout, and norm positions.
+│       │                     the file format (safetensors/GGUF) is parser/'s concern —
+│       │                     what the weights mean and how they compose is arch/'s concern.
+│       │
+│       ├── llama.hpp        — LLaMA 3 / 3.1 / 3.2 / 3.3
+│       ├── qwen2.hpp        — Qwen 2 / 2.5
+│       ├── mistral.hpp      — Mistral / Mixtral (MoE dispatch included)
+│       ├── deepseek.hpp     — DeepSeek V2 / V3 (MoE dispatch included)
+│       ├── phi.hpp          — Phi-3 / Phi-4
+│       ├── gemma.hpp        — Gemma / Gemma 2
+│       ├── falcon.hpp       — Falcon
+│       ├── bert.hpp         — BERT / RoBERTa / DeBERTa / ModernBERT
+│       ├── t5.hpp           — T5 / BART
+│       └── tensor.hpp       — Tensor Series (tensor-pretrain output)
 │
 ├── adapter/        — adapter architecture and forward pass
 │                     AdapterConfig — rank, alpha, target layers derived from base
@@ -155,6 +179,22 @@ tensor-adapt/
                       output is directly loadable by tensor-inference
 ```
 
+### The parser/base split
+
+This distinction matters and is intentional:
+
+`parser/` reads bytes off disk and hands back `TensorView`s. It understands
+`.safetensors` framing, GGUF block structure, and JSON config schemas.
+It does not change when a new model family is added.
+
+`base/arch/` understands what those tensors *are*. LLaMA and Qwen both use
+RMSNorm but store it under different key names. Gemma 2 has interleaved
+local/global attention. Mixtral and DeepSeek route through expert FFNs.
+Phi-3 packs QKV into a single projection. Every architecture has its own
+layer topology, weight naming, and forward pass structure.
+Adding a new architecture means adding a file in `base/arch/`. Nothing in
+`parser/` changes.
+
 **Dependencies flow one direction only:**
 
 ```
@@ -167,7 +207,9 @@ core ←           checkpoint ← trainer
 
 `core` has no dependencies. `backend` builds on `core` — CUDA headers stop here.
 `parser` builds on `core` and never touches `backend` — parsing a file needs no GPU.
-`base` uses `parser` to read weights and `backend` to place them on device.
+`base` uses `parser` to read weight bytes and `backend` to place them on device.
+  `base/arch/` implementations depend on both — they interpret the parsed tensors
+  and own the architecture-specific forward pass.
 `adapter` defines the trainable delta that sits on top of the frozen base.
 `trainer` drives both. `checkpoint` writes the output.
 
@@ -201,6 +243,17 @@ tensor::base::BaseLoader              — load(path, device) → FrozenBase
 tensor::base::FrozenBase              — frozen weights, architecture info,
                                         layer target enumeration, base_sha
 tensor::base::BaseError               — unsupported architecture, corrupt weights
+
+tensor::base::arch::LlamaBase         — LLaMA 3.x layer structure and forward pass
+tensor::base::arch::Qwen2Base         — Qwen 2 / 2.5
+tensor::base::arch::MistralBase       — Mistral / Mixtral
+tensor::base::arch::DeepSeekBase      — DeepSeek V2 / V3
+tensor::base::arch::PhiBase           — Phi-3 / Phi-4
+tensor::base::arch::GemmaBase         — Gemma / Gemma 2
+tensor::base::arch::FalconBase        — Falcon
+tensor::base::arch::BertBase          — BERT / RoBERTa / DeBERTa / ModernBERT
+tensor::base::arch::T5Base            — T5 / BART
+tensor::base::arch::TensorBase        — Tensor Series
 
 tensor::adapter::AdapterConfig        — rank, alpha, target layers derived from base
 tensor::adapter::AdapterModel         — A/B matrices, forward pass delta
@@ -253,9 +306,9 @@ using tensor::trainer::AdaptTrainer;
 
 int main() {
 
-    // 1. load the frozen base — architecture detected from config.json
-    //    weights are read-only from this point forward
-    //    works with LLaMA, Qwen, Mistral, Tensor Series, or any supported model
+    // 1. load the frozen base — architecture detected from config.json,
+    //    dispatched to the correct base/arch/ implementation automatically.
+    //    weights are read-only from this point forward.
     auto base = BaseLoader::load(
         "./models/Llama-3.1-8B/",
         "cuda:0"
@@ -285,7 +338,8 @@ int main() {
 ```
 
 The same code trains adapters for any supported base — swap the model path,
-everything else is automatic.
+`BaseLoader` dispatches to the right `arch/` implementation, everything else
+is automatic.
 
 ```cpp
 // Qwen 2.5
@@ -355,9 +409,10 @@ Configurations are keyed on parameter count and architecture family.
 | 8B – 20B | 32 | 32.0 | all | Q K V O | ✅ |
 | 20B+ | 64 | 64.0 | all | Q K V O | ✅ |
 
-Architecture family affects target layer selection where relevant — for example,
-MoE models (Mixtral, DeepSeek) inject into shared attention layers only,
-not individual expert FFNs.
+Architecture family affects target layer selection where relevant — MoE models
+(Mixtral, DeepSeek) inject into shared attention layers only, not individual
+expert FFNs. This logic lives in the corresponding `base/arch/` implementation
+and is surfaced through `FrozenBase::layer_targets()`.
 
 ---
 
@@ -530,7 +585,7 @@ export HF_TOKEN="hf_your_token_here"
 ### tensor-adapt
 
 ```bash
-# train an adapter — architecture detected automatically from the model directory
+# train an adapter — architecture detected automatically, dispatched to base/arch/
 ./build/tensor-adapt \
     --base   ./models/Llama-3.1-8B/ \
     --data   "bigcode/the-stack-v2:go" \
@@ -539,7 +594,7 @@ export HF_TOKEN="hf_your_token_here"
     --output ./adapters/llama-3.1-8b-golang-gin/ \
     --device cuda:0
 
-# same command, different base — Qwen, Mistral, Tensor Series, any supported model
+# same command, different base — arch/ dispatch is transparent to the caller
 ./build/tensor-adapt \
     --base   ./models/Qwen2.5-7B/ \
     --data   "bigcode/the-stack-v2:go" \
@@ -597,6 +652,7 @@ parser        ████████████████████  comp
 backend/cuda  ████████░░░░░░░░░░░░  in progress
 data          ██████░░░░░░░░░░░░░░  in progress
 base          ██████░░░░░░░░░░░░░░  in progress
+base/arch     ████░░░░░░░░░░░░░░░░  in progress
 adapter       ████░░░░░░░░░░░░░░░░  in progress
 trainer       ████░░░░░░░░░░░░░░░░  in progress
 checkpoint    ████░░░░░░░░░░░░░░░░  in progress
@@ -620,4 +676,4 @@ CLI tools     ██░░░░░░░░░░░░░░░░░░  in p
 
 *Part of the **Tensor Framework** by Netangular.*
 *tensor-pretrain → tensor-adapt → tensor-inference*
-*Apache 2.0 — free to use, modify, and build on, including for commercial purposes.* for non-Tensor-Series models. Everything else flows naturally from those two changes.
+*Apache 2.0 — free to use, modify, and build on, including for commercial purposes.*
