@@ -31,7 +31,8 @@ cd tensor-adapt
 If you don't have vcpkg yet:
 
 ```bash
-git clone https://github.com/microsoft/vcpkg.git
+apt-get install curl zip unzip tar pkg-config flex bison cmake
+git clone --depth 1 https://github.com/microsoft/vcpkg.git
 cd vcpkg && ./bootstrap-vcpkg.sh
 cd ..
 ```

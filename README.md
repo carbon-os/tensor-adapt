@@ -1,15 +1,18 @@
-# tensor-adapt
-
-> Part of the **Tensor Framework** by Netangular
-
-A native C++ adapter training library for transformer-architecture models.
-Load any supported base model, train a tensor adapter on focused data, deploy with tensor-inference.
-Nothing else.
+<h1 align="center">
+  <img src="./assets/logo.png" alt="Tensor Adapt" width="400px">
+</h1>
+<h4 align="center">Native C++ Adapter Training Library<br>Frozen Base · Low-Rank Deltas · Hot-Swap Deployment</h4>
+<p align="center">
+    <img src="https://img.shields.io/badge/Version-0.1.0-blue" alt="Version">
+    <img src="https://img.shields.io/badge/Architectures-LLaMA%20%7C%20Qwen%20%7C%20Mistral%20%7C%20More-blue" alt="Architectures">
+    <img src="https://img.shields.io/badge/Backend-CUDA-blue" alt="Backend">
+    <img src="https://img.shields.io/badge/Output-safetensors-blue" alt="Output">
+    <img src="https://img.shields.io/badge/License-Apache%202.0-blue" alt="License">
+</p>
 
 ---
 
 ## The Tensor Framework
-
 ```
 tensor-pretrain     train base models from scratch
 tensor-adapt        extend base knowledge with tensor adapters          ← you are here
@@ -67,7 +70,6 @@ with a known format that `tensor-inference` can load and trust.
 
 `tensor-adapt` loads any model that `tensor-inference` can run.
 Tensor adapters can be trained against any of these architectures:
-
 ```
 Decoder-only     LLaMA 3 / 3.1 / 3.2 / 3.3
                  Qwen 2 / 2.5
@@ -90,7 +92,6 @@ the same formats `tensor-inference` accepts. Any model `tensor-inference` can ru
 ---
 
 ## What it produces
-
 ```
 adapters/golang-gin/
 ├── adapter.safetensors     # A/B weight matrices for every injected layer
@@ -105,7 +106,6 @@ doesn't match the loaded base.
 ---
 
 ## Structure
-
 ```
 tensor-adapt/
 │
@@ -196,7 +196,6 @@ Adding a new architecture means adding a file in `base/arch/`. Nothing in
 `parser/` changes.
 
 **Dependencies flow one direction only:**
-
 ```
 core ← backend ← base    ← trainer
 core ← backend ← adapter ← trainer
@@ -208,15 +207,14 @@ core ←           checkpoint ← trainer
 `core` has no dependencies. `backend` builds on `core` — CUDA headers stop here.
 `parser` builds on `core` and never touches `backend` — parsing a file needs no GPU.
 `base` uses `parser` to read weight bytes and `backend` to place them on device.
-  `base/arch/` implementations depend on both — they interpret the parsed tensors
-  and own the architecture-specific forward pass.
+`base/arch/` implementations depend on both — they interpret the parsed tensors
+and own the architecture-specific forward pass.
 `adapter` defines the trainable delta that sits on top of the frozen base.
 `trainer` drives both. `checkpoint` writes the output.
 
 ---
 
 ## Namespace map
-
 ```
 tensor::core::DType
 tensor::core::Shape
@@ -276,7 +274,6 @@ tensor::checkpoint::AdapterLoader     — loads and validates an adapter checkpo
 Same tooling as `tensor-pretrain`. `data-fetch` resolves `hf://` URIs and
 stores everything under `~/.cache/tensor/`. Fetch once, train as many
 adapters as needed.
-
 ```bash
 # fetch a domain-specific dataset
 ./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
@@ -290,7 +287,6 @@ export HF_TOKEN="hf_your_token_here"
 ---
 
 ## End-to-end example
-
 ```cpp
 #include <tensor/base/base_loader.hpp>
 #include <tensor/data/dataset.hpp>
@@ -340,7 +336,6 @@ int main() {
 The same code trains adapters for any supported base — swap the model path,
 `BaseLoader` dispatches to the right `arch/` implementation, everything else
 is automatic.
-
 ```cpp
 // Qwen 2.5
 auto base = BaseLoader::load("./models/Qwen2.5-7B/",          "cuda:0");
@@ -360,13 +355,11 @@ auto base = BaseLoader::load("./checkpoints/tensor-pro/eval-step-700000/", "cuda
 hidden size, number of layers, attention head structure — and selects the
 appropriate locked configuration for that model class.
 Nothing in it is settable at runtime.
-
 ```cpp
 #include <tensor/adapter/adapter_config.hpp>
 
 using tensor::adapter::AdapterConfig;
 ```
-
 ```cpp
 auto config = AdapterConfig::for_base(base);
 
@@ -417,7 +410,6 @@ and is surfaced through `FrozenBase::layer_targets()`.
 ---
 
 ## AdaptOptions — the only thing the caller controls
-
 ```cpp
 struct AdaptOptions {
     std::string  domain;            // namespaced domain label, e.g. "golang/gin"
@@ -437,7 +429,6 @@ belongs here. Those are in `AdapterConfig`. `AdaptOptions` is purely operational
 ---
 
 ## Training loop
-
 ```cpp
 auto trainer = AdaptTrainer::create(base, config, dataset, options);
 
@@ -457,7 +448,6 @@ while (!trainer.done()) {
 ```
 
 ### Cosine schedule
-
 ```
 LR
  │
@@ -476,7 +466,6 @@ Warmup step count scales with base model size — larger bases need a
 gentler ramp. Minimum LR floor is `lr × 0.1`.
 
 ### AdamW — adapter settings
-
 ```
 β1 = 0.9
 β2 = 0.999   (tighter than base training — adapter signal is narrower)
@@ -494,7 +483,6 @@ Base model weights receive no gradient signal at any point.
 
 All adapter output is safetensors. No other format.
 Output is directly loadable by `tensor-inference`.
-
 ```cpp
 // trainer writes automatically at checkpoint_every steps
 // or trigger manually
@@ -503,7 +491,6 @@ trainer.save_adapter("./adapters/llama-3.1-8b-golang-gin/");
 ```
 
 **Mid-run checkpoint layout:**
-
 ```
 llama-3.1-8b-golang-gin-step-5000/
 ├── adapter.safetensors     # A/B matrices for all injected layers
@@ -513,7 +500,6 @@ llama-3.1-8b-golang-gin-step-5000/
 ```
 
 **Final adapter layout** (matches the tensor-inference load format):
-
 ```
 llama-3.1-8b-golang-gin/
 ├── adapter.safetensors     # A/B matrices — inference-ready
@@ -522,7 +508,6 @@ llama-3.1-8b-golang-gin/
 ```
 
 ### adapter.json
-
 ```json
 {
   "domain":          "golang/gin",
@@ -551,7 +536,6 @@ or matrix shapes are inconsistent with the loaded architecture.
 ---
 
 ## Resuming
-
 ```cpp
 auto options = AdaptOptions {
     .domain      = "golang/gin",
@@ -573,7 +557,6 @@ trainer.run();  // continues from step 5000, same data position
 ### data-fetch
 
 Same tool as `tensor-pretrain`. Fetch once, use for base training and adapters.
-
 ```bash
 ./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
 ./build/data-fetch fetch hf://HuggingFaceTB/smollm-corpus --subset python-edu
@@ -583,7 +566,6 @@ export HF_TOKEN="hf_your_token_here"
 ```
 
 ### tensor-adapt
-
 ```bash
 # train an adapter — architecture detected automatically, dispatched to base/arch/
 ./build/tensor-adapt \
@@ -623,7 +605,6 @@ export HF_TOKEN="hf_your_token_here"
 - CUDA Toolkit 11.8+ — Volta or newer (sm_70+)
 
 ### Build
-
 ```bash
 git clone https://github.com/netangular/tensor-adapt
 cd tensor-adapt
@@ -644,7 +625,6 @@ cmake --build build --parallel
 ---
 
 ## Status
-
 ```
 core          ████████████████████  complete
 resolve       ████████████████████  complete
@@ -674,6 +654,6 @@ CLI tools     ██░░░░░░░░░░░░░░░░░░  in p
 
 ---
 
-*Part of the **Tensor Framework** by Netangular.*
-*tensor-pretrain → tensor-adapt → tensor-inference*
-*Apache 2.0 — free to use, modify, and build on, including for commercial purposes.*
+**Tensor Framework** is developed by [Netangular](https://github.com/netangular).  
+*tensor-pretrain → tensor-adapt → tensor-inference*  
+Apache 2.0 — free to use, modify, and build on, including for commercial purposes.
