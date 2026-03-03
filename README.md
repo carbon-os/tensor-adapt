@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./assets/logo_.png" alt="Tensor Adapt" width="400px">
+  <img src="./assets/logo_2.png" alt="Tensor Adapt" width="400px">
 
   <div style="margin-bottom: 24px;">
 
