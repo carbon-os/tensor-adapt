@@ -22,7 +22,7 @@ required.
 
 ---
 
-## Not just LoRA
+## Router-Native Adapters
 
 Tensor adapters are structurally compatible with standard LoRA — the A/B weight 
 matrices are the same, the training mechanics are the same. But they are not 
