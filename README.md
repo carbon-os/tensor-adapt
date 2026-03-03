@@ -37,7 +37,7 @@ a base model to deploying a system that loads and unloads domain knowledge on de
 Base models are general. Production systems are not.
 
 A code assistant needs deep knowledge of specific libraries.
-A legal assistant needs familiarity with specific document structures.
+A reasoning assistant needs familiarity with specific document structures.
 A support agent needs to know a specific product inside out.
 
 Retraining a base model for each domain is expensive, slow, and produces
