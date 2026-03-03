@@ -16,7 +16,77 @@
 
 <br>
 
-Native C++ adapter training library built for performance. Freeze your base model, train low-rank delta weights, and hot-swap adapters at deployment — no full fine-tune required.
+Native C++ adapter training library built for performance. Freeze your base model, 
+train low-rank delta weights, and hot-swap adapters at deployment — no full fine-tune 
+required.
+
+---
+
+## Not just LoRA
+
+Tensor adapters are structurally compatible with standard LoRA — the A/B weight 
+matrices are the same, the training mechanics are the same. But they are not 
+general-purpose LoRA adapters. They are built specifically to run inside 
+`tensor-inference`, which operates a modified Mixture-of-Experts router capable 
+of managing millions of adapters simultaneously.
+
+For that router to work, it needs to know what each adapter actually learned — 
+not a label you wrote by hand, not a filename, not a domain tag in a config. 
+It needs a mathematical description of the adapter's learned expertise, derived 
+automatically from the training process itself.
+
+That description is the **Semantic Centroid**.
+
+---
+
+## Semantic Centroids
+
+Every tensor adapter produces two output files:
+
+```
+adapter.safetensors   — the A/B weight matrices (what the adapter knows)
+adapter.centroid      — the semantic centroid   (where it lives in latent space)
+```
+
+The `.centroid` file is a 512-dimensional vector. It is not hand-crafted. 
+It is not an embedding of the domain label. It is computed automatically 
+during training by the **Centroid Accumulator** — a component that runs 
+as a side-channel inside the training loop.
+
+### How it is produced
+
+During the backward pass, the Centroid Accumulator monitors gradient norms 
+token by token. Hidden states that produce the highest gradient signal — the 
+tokens the model learned from most — are weighted heavily and accumulated into 
+a running centroid:
+
+```
+C = Σ ( hₜ · ‖∇Lₜ‖ )
+```
+
+At the end of training, this centroid is normalized to the unit sphere and 
+written to `adapter.centroid`. It represents the **semantic center of mass** 
+of everything the adapter absorbed — not what you told it to learn, but what 
+the gradient signal says it actually learned.
+
+### Why this matters
+
+`tensor-inference` loads `.centroid` files at startup and builds a 
+**Product Key Memory (PKM) index** — a two-codebook structure that maps 
+every centroid to a discrete address in a 512×512 = 262,144 bucket space. 
+At inference time, the router computes the nearest PKM address from the 
+model's current residual stream and retrieves the matching adapter in O(1).
+
+No embedding call. No keyword search. No manual routing rules.
+
+The residual stream at inference time lives in the same vector space as the 
+centroid. The query and the index are naturally aligned. The router finds the 
+right adapter because the centroid was built from the same signal the base 
+model uses to process tokens.
+
+A standard LoRA adapter has no centroid. It can be loaded manually or by name, 
+but it cannot be discovered automatically by a semantic router. Tensor adapters 
+can — that is the distinction.
 
 ---
 
@@ -28,7 +98,8 @@ tensor-inference    run base models + hot-swap adapters at runtime
 ```
 
 Each tool is independent. Together they form a complete pipeline — from training
-a base model to deploying a system that loads and unloads domain knowledge on demand.
+a base model to deploying a system that loads and unloads domain knowledge on 
+demand.
 
 ---
 
@@ -50,7 +121,27 @@ becomes a small, independently loadable artifact — a few megabytes — that
 Swap a domain in, answer a question, swap it out. The base never moves.
 Thousands of adapters can share a single base in memory.
 
-`tensor-adapt` is the tool that produces those artifacts — against any supported base model.
+`tensor-adapt` is the tool that produces those artifacts — against any supported 
+base model.
+
+---
+
+## What it produces
+```
+adapters/golang-gin/
+├── adapter.safetensors     # A/B weight matrices for every injected layer
+├── adapter.centroid        # 512-dim semantic centroid — router index key
+├── adapter.json            # metadata — base ref, architecture, rank, alpha, 
+│                           #            layer range, domain
+└── tokenizer/              # symlink to base model tokenizer
+```
+
+`adapter.json` is the contract between `tensor-adapt` and `tensor-inference`.
+`tensor-inference` reads it at load time and rejects the adapter if anything
+doesn't match the loaded base.
+
+`adapter.centroid` is the contract between `tensor-adapt` and the PKM router.
+Without it, the adapter exists but cannot be discovered at inference time.
 
 ---
 
@@ -96,20 +187,6 @@ Encoder-Decoder  T5 / BART
 Base models are loaded from a local directory in `.safetensors` or `.gguf` format —
 the same formats `tensor-inference` accepts. Any model `tensor-inference` can run,
 `tensor-adapt` can train adapters against.
-
----
-
-## What it produces
-```
-adapters/golang-gin/
-├── adapter.safetensors     # A/B weight matrices for every injected layer
-├── adapter.json            # metadata — base ref, architecture, rank, alpha, layer range, domain
-└── tokenizer/              # symlink to base model tokenizer
-```
-
-`adapter.json` is the contract between `tensor-adapt` and `tensor-inference`.
-`tensor-inference` reads it at load time and rejects the adapter if anything
-doesn't match the loaded base.
 
 ---
 
@@ -160,6 +237,8 @@ tensor-adapt/
 │       │                     attention variant, FFN layout, and norm positions.
 │       │                     the file format (safetensors/GGUF) is parser/'s concern —
 │       │                     what the weights mean and how they compose is arch/'s concern.
+│       │                     adding a new architecture means adding a file in base/arch/.
+│       │                     nothing in parser/ changes.
 │       │
 │       ├── llama.hpp        — LLaMA 3 / 3.1 / 3.2 / 3.3
 │       ├── qwen2.hpp        — Qwen 2 / 2.5
@@ -172,6 +251,11 @@ tensor-adapt/
 │       ├── t5.hpp           — T5 / BART
 │       └── tensor.hpp       — Tensor Series (tensor-pretrain output)
 │
+├── centroid/       — semantic centroid accumulation and serialization
+│                     CentroidAccumulator — gradient-weighted hidden state accumulator
+│                     CentroidWriter      — normalizes and writes .centroid file
+│                     hooks into trainer/ backward pass, zero overhead on forward
+│
 ├── adapter/        — adapter architecture and forward pass
 │                     AdapterConfig — rank, alpha, target layers derived from base
 │                     AdapterModel  — A/B matrices, merged forward pass
@@ -183,42 +267,9 @@ tensor-adapt/
 │                     gradient clipping, BF16 + FP32 master weights
 │                     base weights excluded from all gradient ops
 │
-└── checkpoint/     — safetensors save, adapter.json serialization
+└── checkpoint/     — safetensors save, adapter.json + .centroid serialization
                       output is directly loadable by tensor-inference
 ```
-
-### The parser/base split
-
-This distinction matters and is intentional:
-
-`parser/` reads bytes off disk and hands back `TensorView`s. It understands
-`.safetensors` framing, GGUF block structure, and JSON config schemas.
-It does not change when a new model family is added.
-
-`base/arch/` understands what those tensors *are*. LLaMA and Qwen both use
-RMSNorm but store it under different key names. Gemma 2 has interleaved
-local/global attention. Mixtral and DeepSeek route through expert FFNs.
-Phi-3 packs QKV into a single projection. Every architecture has its own
-layer topology, weight naming, and forward pass structure.
-Adding a new architecture means adding a file in `base/arch/`. Nothing in
-`parser/` changes.
-
-**Dependencies flow one direction only:**
-```
-core ← backend ← base    ← trainer
-core ← backend ← adapter ← trainer
-core ← parser  ← base
-core ← resolve ← data    ← trainer
-core ←           checkpoint ← trainer
-```
-
-`core` has no dependencies. `backend` builds on `core` — CUDA headers stop here.
-`parser` builds on `core` and never touches `backend` — parsing a file needs no GPU.
-`base` uses `parser` to read weight bytes and `backend` to place them on device.
-`base/arch/` implementations depend on both — they interpret the parsed tensors
-and own the architecture-specific forward pass.
-`adapter` defines the trainable delta that sits on top of the frozen base.
-`trainer` drives both. `checkpoint` writes the output.
 
 ---
 
@@ -261,6 +312,10 @@ tensor::base::arch::BertBase          — BERT / RoBERTa / DeBERTa / ModernBERT
 tensor::base::arch::T5Base            — T5 / BART
 tensor::base::arch::TensorBase        — Tensor Series
 
+tensor::centroid::CentroidAccumulator — hooks into backward pass, accumulates
+                                        gradient-weighted hidden states
+tensor::centroid::CentroidWriter      — finalizes, normalizes, writes .centroid
+
 tensor::adapter::AdapterConfig        — rank, alpha, target layers derived from base
 tensor::adapter::AdapterModel         — A/B matrices, forward pass delta
 tensor::adapter::AdaptOptions         — what the caller can actually change
@@ -272,24 +327,8 @@ tensor::trainer::CosineSchedule       — warmup → cosine decay
 tensor::trainer::GradClipper          — gradient norm clipping
 
 tensor::checkpoint::AdapterWriter     — writes adapter.safetensors + adapter.json
+                                        + adapter.centroid
 tensor::checkpoint::AdapterLoader     — loads and validates an adapter checkpoint
-```
-
----
-
-## Getting datasets
-
-Same tooling as `tensor-pretrain`. `data-fetch` resolves `hf://` URIs and
-stores everything under `~/.cache/tensor/`. Fetch once, train as many
-adapters as needed.
-```bash
-# fetch a domain-specific dataset
-./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
-./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset python
-
-# gated datasets
-export HF_TOKEN="hf_your_token_here"
-./build/data-fetch fetch hf://some-org/some-dataset
 ```
 
 ---
@@ -336,24 +375,16 @@ int main() {
     };
 
     // 5. train
+    //    CentroidAccumulator runs automatically inside the training loop.
+    //    adapter.centroid is written alongside adapter.safetensors on save.
     auto trainer = AdaptTrainer::create(base, config, dataset, options);
     trainer.run();
 }
 ```
 
-The same code trains adapters for any supported base — swap the model path,
-`BaseLoader` dispatches to the right `arch/` implementation, everything else
-is automatic.
-```cpp
-// Qwen 2.5
-auto base = BaseLoader::load("./models/Qwen2.5-7B/",          "cuda:0");
-
-// Mistral
-auto base = BaseLoader::load("./models/Mistral-7B-v0.3/",     "cuda:0");
-
-// Tensor Series
-auto base = BaseLoader::load("./checkpoints/tensor-pro/eval-step-700000/", "cuda:0");
-```
+The centroid accumulator requires no configuration. It runs as part of every 
+training loop and is not optional — an adapter without a `.centroid` file 
+cannot be indexed by `tensor-inference`.
 
 ---
 
@@ -363,11 +394,6 @@ auto base = BaseLoader::load("./checkpoints/tensor-pro/eval-step-700000/", "cuda
 hidden size, number of layers, attention head structure — and selects the
 appropriate locked configuration for that model class.
 Nothing in it is settable at runtime.
-```cpp
-#include <tensor/adapter/adapter_config.hpp>
-
-using tensor::adapter::AdapterConfig;
-```
 ```cpp
 auto config = AdapterConfig::for_base(base);
 
@@ -398,8 +424,6 @@ std::size_t params       = config.base_parameters();
 ```
 
 ### Config ladder
-
-Configurations are keyed on parameter count and architecture family.
 
 | Parameter Range | Rank | Alpha | Target Layers | Inject Attn | Inject FFN |
 |---|---|---|---|---|---|
@@ -492,8 +516,6 @@ Base model weights receive no gradient signal at any point.
 All adapter output is safetensors. No other format.
 Output is directly loadable by `tensor-inference`.
 ```cpp
-// trainer writes automatically at checkpoint_every steps
-// or trigger manually
 trainer.save_checkpoint("./adapters/llama-3.1-8b-golang-gin/step-5000/");
 trainer.save_adapter("./adapters/llama-3.1-8b-golang-gin/");
 ```
@@ -502,6 +524,7 @@ trainer.save_adapter("./adapters/llama-3.1-8b-golang-gin/");
 ```
 llama-3.1-8b-golang-gin-step-5000/
 ├── adapter.safetensors     # A/B matrices for all injected layers
+├── adapter.centroid        # centroid snapshot at this step
 ├── optimizer.safetensors   # AdamW m, v, step tensors
 ├── train_state.json        # step, tokens_consumed, data position, RNG state
 └── adapter.json            # AdapterConfig snapshot + base model ref
@@ -511,6 +534,7 @@ llama-3.1-8b-golang-gin-step-5000/
 ```
 llama-3.1-8b-golang-gin/
 ├── adapter.safetensors     # A/B matrices — inference-ready
+├── adapter.centroid        # semantic centroid — PKM router index key
 ├── adapter.json            # metadata contract read by tensor-inference
 └── tokenizer/              # symlink to base model tokenizer
 ```
@@ -533,13 +557,14 @@ llama-3.1-8b-golang-gin/
   "inject_up":       true,
   "inject_down":     true,
   "tokens_trained":  48302080,
+  "centroid_dim":    512,
   "tensor_adapt_version": "0.1.0"
 }
 ```
 
-`tensor-inference` reads this at `Adapter::load` time and rejects the adapter if
-`base_model` or `base_sha` don't match the loaded base, or if the layer range
-or matrix shapes are inconsistent with the loaded architecture.
+`centroid_dim` is written by the CentroidAccumulator and validated by 
+`tensor-inference` at index build time. A mismatch against the PKM codebook 
+dimension is a hard reject.
 
 ---
 
@@ -554,8 +579,24 @@ auto options = AdaptOptions {
 
 // seed is ignored on resume — RNG state is restored from checkpoint
 // adapter.json is validated on load — mismatched base ref fails immediately
+// centroid accumulator state is restored from the step-5000 snapshot
 auto trainer = AdaptTrainer::create(base, config, dataset, options);
 trainer.run();  // continues from step 5000, same data position
+```
+
+---
+
+## Getting datasets
+
+Same tooling as `tensor-pretrain`. `data-fetch` resolves `hf://` URIs and
+stores everything under `~/.cache/tensor/`. Fetch once, train as many
+adapters as needed.
+```bash
+./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
+./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset python
+
+export HF_TOKEN="hf_your_token_here"
+./build/data-fetch fetch hf://some-org/some-dataset
 ```
 
 ---
@@ -563,8 +604,6 @@ trainer.run();  // continues from step 5000, same data position
 ## CLI tools
 
 ### data-fetch
-
-Same tool as `tensor-pretrain`. Fetch once, use for base training and adapters.
 ```bash
 ./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
 ./build/data-fetch fetch hf://HuggingFaceTB/smollm-corpus --subset python-edu
@@ -575,7 +614,7 @@ export HF_TOKEN="hf_your_token_here"
 
 ### tensor-adapt
 ```bash
-# train an adapter — architecture detected automatically, dispatched to base/arch/
+# train — architecture detected automatically, centroid produced automatically
 ./build/tensor-adapt \
     --base   ./models/Llama-3.1-8B/ \
     --data   "bigcode/the-stack-v2:go" \
@@ -584,7 +623,7 @@ export HF_TOKEN="hf_your_token_here"
     --output ./adapters/llama-3.1-8b-golang-gin/ \
     --device cuda:0
 
-# same command, different base — arch/ dispatch is transparent to the caller
+# same command, different base
 ./build/tensor-adapt \
     --base   ./models/Qwen2.5-7B/ \
     --data   "bigcode/the-stack-v2:go" \
@@ -593,7 +632,7 @@ export HF_TOKEN="hf_your_token_here"
     --output ./adapters/qwen2.5-7b-golang-gin/ \
     --device cuda:0
 
-# resume
+# resume — centroid accumulator state restored from checkpoint
 ./build/tensor-adapt \
     --base    ./models/Llama-3.1-8B/ \
     --domain  "golang/gin" \
@@ -641,6 +680,7 @@ backend/cuda  ████████░░░░░░░░░░░░  in p
 data          ██████░░░░░░░░░░░░░░  in progress
 base          ██████░░░░░░░░░░░░░░  in progress
 base/arch     ████░░░░░░░░░░░░░░░░  in progress
+centroid      ████░░░░░░░░░░░░░░░░  in progress
 adapter       ████░░░░░░░░░░░░░░░░  in progress
 trainer       ████░░░░░░░░░░░░░░░░  in progress
 checkpoint    ████░░░░░░░░░░░░░░░░  in progress
@@ -659,6 +699,7 @@ CLI tools     ██░░░░░░░░░░░░░░░░░░  in p
 - **Configurable optimizer betas** — fixed per adapter spec
 - **Alternative LR schedules** — cosine only
 - **GGUF or pickle output** — safetensors only
+- **Adapters without centroids** — every adapter must be router-discoverable
 
 ---
 
