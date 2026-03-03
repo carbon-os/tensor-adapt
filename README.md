@@ -11,7 +11,6 @@
 ![Architectures](https://img.shields.io/badge/Architectures-LLaMA%20%7C%20Qwen%20%7C%20Mistral%20%7C%20More-blue)
 ![Backend](https://img.shields.io/badge/Backend-CUDA-blue)
 ![Output](https://img.shields.io/badge/Output-safetensors-blue)
-![License](https://img.shields.io/badge/License-Apache%202.0-blue)
 
 </div>
 
