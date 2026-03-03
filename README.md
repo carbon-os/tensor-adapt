@@ -1,9 +1,11 @@
 <div align="center">
-  <img src="./assets/logo.png" alt="Tensor Adapt" width="400px">
+  <img src="./assets/logo_.png" alt="Tensor Adapt" width="400px">
+
+  <div style="margin-bottom: 24px;">
 
 # Tensor Adapt
 
-<br>
+  </div>
 
 ![Version](https://img.shields.io/badge/Version-0.1.0-blue)
 ![Architectures](https://img.shields.io/badge/Architectures-LLaMA%20%7C%20Qwen%20%7C%20Mistral%20%7C%20More-blue)
