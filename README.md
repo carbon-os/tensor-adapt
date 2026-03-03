@@ -7,10 +7,10 @@
 
   </div>
 
-![Version](https://img.shields.io/badge/Version-0.1.0-blue)
-![Architectures](https://img.shields.io/badge/Architectures-LLaMA%20%7C%20Qwen%20%7C%20Mistral%20%7C%20More-blue)
+![Framework](https://img.shields.io/badge/Tensor-Framework-blue)
+![Adapters](https://img.shields.io/badge/Adapters-Low--Rank%20Delta-blue)
+![Precision](https://img.shields.io/badge/Precision-BF16%20%2B%20FP32-blue)
 ![Backend](https://img.shields.io/badge/Backend-CUDA-blue)
-![Output](https://img.shields.io/badge/Output-safetensors-blue)
 
 </div>
 
