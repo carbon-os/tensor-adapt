@@ -1,19 +1,24 @@
 <div align="center">
-  <img src="./assets/logo_.png" alt="Tensor Adapt" width="400px">
+  <img src="./assets/logo.png" alt="Tensor Adapt" width="400px">
 
 # Tensor Adapt
-</div>
 
-Native C++ adapter training library built for performance. Freeze your base model, train low-rank delta weights, and hot-swap adapters at deployment — no full fine-tune required.
-
-**Architectures:** LLaMA · Qwen · Mistral · More  
-**Backend:** CUDA &nbsp;|&nbsp; **Output:** safetensors &nbsp;|&nbsp; **License:** Apache 2.0
+<br>
 
 ![Version](https://img.shields.io/badge/Version-0.1.0-blue)
 ![Architectures](https://img.shields.io/badge/Architectures-LLaMA%20%7C%20Qwen%20%7C%20Mistral%20%7C%20More-blue)
 ![Backend](https://img.shields.io/badge/Backend-CUDA-blue)
 ![Output](https://img.shields.io/badge/Output-safetensors-blue)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue)
+
+</div>
+
+<br>
+
+Native C++ adapter training library built for performance. Freeze your base model, train low-rank delta weights, and hot-swap adapters at deployment — no full fine-tune required.
+
+**Architectures:** LLaMA · Qwen · Mistral · More  
+**Backend:** CUDA &nbsp;|&nbsp; **Output:** safetensors &nbsp;|&nbsp; **License:** Apache 2.0
 
 ---
 
