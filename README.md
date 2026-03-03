@@ -18,9 +18,6 @@
 
 Native C++ adapter training library built for performance. Freeze your base model, train low-rank delta weights, and hot-swap adapters at deployment — no full fine-tune required.
 
-**Architectures:** LLaMA · Qwen · Mistral · More  
-**Backend:** CUDA &nbsp;|&nbsp; **Output:** safetensors &nbsp;|&nbsp; **License:** Apache 2.0
-
 ---
 
 ## The Tensor Framework
