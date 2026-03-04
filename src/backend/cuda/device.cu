@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <iostream>   // ← add this
 #include <string>
 #include <stdexcept>
 
@@ -26,13 +27,23 @@ Device Device::open(const std::string& spec) {
     d.id_ = parse_spec(spec);
 
     CUDA_CHECK(cudaSetDevice(d.id_));
-    CUDA_CHECK(cudaStreamCreate(&d.stream_));
 
+    // Detect compute capability so callers can choose GEMM paths.
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, d.id_));
+    d.sm_major_ = prop.major;
+
+    CUDA_CHECK(cudaStreamCreate(&d.stream_));
     CUBLAS_CHECK(cublasCreate(&d.cublas_));
     CUBLAS_CHECK(cublasSetStream(d.cublas_, d.stream_));
-    // Use tensor cores where available.
     CUBLAS_CHECK(cublasSetMathMode(d.cublas_, CUBLAS_DEFAULT_MATH));
 
+    std::cerr << "[device] cuda:" << d.id_
+              << " sm=" << prop.major << "." << prop.minor
+              << " (" << prop.name << ")"
+              << (d.supports_bf16_gemm() ? " BF16-GEMM=native"
+                                         : " BF16-GEMM=emulated")
+              << "\n";
     return d;
 }
 

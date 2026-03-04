@@ -1,15 +1,12 @@
+// adapter_config.hpp
 #pragma once
 
 #include <tensor/base/frozen_base.hpp>
+#include <tensor/backend/cuda/device.hpp>
 #include <cstddef>
 #include <string>
 
 namespace tensor::adapter {
-
-// ─────────────────────────────────────────────────────────────
-//  AdapterConfig — derived from base, locked per model class.
-//  See README config ladder.
-// ─────────────────────────────────────────────────────────────
 
 struct AdapterConfig {
     int         rank         = 16;
@@ -30,10 +27,15 @@ struct AdapterConfig {
     std::size_t seq_len      = 2048;
     std::size_t warmup_steps = 200;
 
-    std::string architecture;       // "qwen2", "llama", ...
+    std::string architecture;
     std::size_t base_parameters = 0;
 
-    static AdapterConfig for_base(const base::FrozenBase& base);
+    // Derive config from base architecture, then scale batch/seq to fit device VRAM.
+    // Device is queried for free memory after the base model is already loaded —
+    // so the budget reflects what is actually available for training activations.
+    static AdapterConfig for_base(
+        const base::FrozenBase&          base,
+        const backend::cuda::Device&     dev);
 
     float scale() const { return alpha / (float)rank; }
 };

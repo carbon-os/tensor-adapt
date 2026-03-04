@@ -51,30 +51,31 @@ struct CudaError : std::runtime_error {
 
 class Device {
 public:
-    // Parse "cuda:0" → open device 0.
     static Device open(const std::string& spec);
 
-    int            id()     const noexcept { return id_;     }
-    cublasHandle_t cublas() const noexcept { return cublas_; }
-    cudaStream_t   stream() const noexcept { return stream_; }
+    int            id()       const noexcept { return id_;       }
+    cublasHandle_t cublas()   const noexcept { return cublas_;   }
+    cudaStream_t   stream()   const noexcept { return stream_;   }
+    int            sm_major() const noexcept { return sm_major_; }
 
-    // Synchronise the device stream — call before reading host results.
+    // True when BF16 GEMM is natively supported (Ampere sm_80+).
+    bool supports_bf16_gemm() const noexcept { return sm_major_ >= 8; }
+
     void sync() const;
 
     Device(Device&&) noexcept;
     Device& operator=(Device&&) noexcept;
-
     Device(const Device&)            = delete;
     Device& operator=(const Device&) = delete;
-
     ~Device();
 
 private:
     Device() = default;
 
-    int            id_     = 0;
-    cublasHandle_t cublas_ = nullptr;
-    cudaStream_t   stream_ = nullptr;
+    int            id_       = 0;
+    int            sm_major_ = 0;   // ← new
+    cublasHandle_t cublas_   = nullptr;
+    cudaStream_t   stream_   = nullptr;
 };
 
 } // namespace tensor::backend::cuda

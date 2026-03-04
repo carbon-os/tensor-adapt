@@ -8,6 +8,38 @@
 namespace tensor::backend::cuda::ops {
 
 // ─────────────────────────────────────────────────────────────
+//  AtomicAdd Shim for BFloat16
+// ─────────────────────────────────────────────────────────────
+// We rename this to 'atomic_add_bf16' to avoid name collision 
+// with standard CUDA headers and to prevent hiding the float 
+// overloads for other kernels.
+
+__device__ __forceinline__ void atomic_add_bf16(__nv_bfloat16* address, __nv_bfloat16 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Manual CAS loop for Pascal/Volta/Turing (sm_70 - sm_75)
+    unsigned short* address_as_us = (unsigned short*)address;
+    unsigned short old = *address_as_us, assumed;
+
+    do {
+        assumed = old;
+        // 1. Read as bf16
+        // 2. Convert to float
+        // 3. Add
+        // 4. Convert back to bf16
+        float fsum = __bfloat162float(*(__nv_bfloat16*)&assumed) + __bfloat162float(val);
+        __nv_bfloat16 bsum = __float2bfloat16(fsum);
+        unsigned short new_val = *(unsigned short*)&bsum;
+
+        // 5. Compare and Swap
+        old = atomicCAS(address_as_us, assumed, new_val);
+    } while (assumed != old);
+#else
+    // Native hardware instruction for Ampere (sm_80) and newer
+    atomicAdd(address, val);
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Utility
 // ─────────────────────────────────────────────────────────────
 
@@ -30,26 +62,23 @@ float warp_reduce_max(float v) {
 // ─────────────────────────────────────────────────────────────
 //  RMSNorm forward
 // ─────────────────────────────────────────────────────────────
-// One block per (b,t) row.  Threads reduce over D.
 
 __global__ void k_rms_norm_fwd(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
     __nv_bfloat16* __restrict__       out,
-    float*         __restrict__       rms_out,
+    float* __restrict__       rms_out,
     int D, float eps)
 {
     int row = blockIdx.x;
     const __nv_bfloat16* xr = x   + row * D;
-    __nv_bfloat16*       or_ = out + row * D;
+    __nv_bfloat16* or_ = out + row * D;
 
-    // Compute sum of squares using parallel reduction over threads.
     float ss = 0.f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float xi = __bfloat162float(xr[i]);
         ss += xi * xi;
     }
-    // Block reduce.
     __shared__ float smem[32];
     int lane = threadIdx.x % WARP;
     int wid  = threadIdx.x / WARP;
@@ -88,25 +117,22 @@ void rms_norm_fwd(
 // ─────────────────────────────────────────────────────────────
 //  RMSNorm backward
 // ─────────────────────────────────────────────────────────────
-// dx[i] = w[i]*rms * (dy[i] - x_hat[i] * sum_j(dy[j]*w[j]*x_hat[j]) / D)
-// dw[i] += sum_{b,t} dy[b,t,i] * x_hat[b,t,i]
 
 __global__ void k_rms_norm_bwd(
     const __nv_bfloat16* __restrict__ dy,
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
-    const float*         __restrict__ rms_saved,
-    __nv_bfloat16*       __restrict__ dx,
-    float*               __restrict__ dw,
+    const float* __restrict__ rms_saved,
+    __nv_bfloat16* __restrict__ dx,
+    float* __restrict__ dw,
     int D, float eps)
 {
     int row = blockIdx.x;
     const __nv_bfloat16* dyr = dy  + row * D;
     const __nv_bfloat16* xr  = x   + row * D;
-    __nv_bfloat16*       dxr = dx  + row * D;
-    float rms = rms_saved[row]; // this is rsqrt(mean(x^2)+eps)
+    __nv_bfloat16* dxr = dx  + row * D;
+    float rms = rms_saved[row];
 
-    // dot = sum_i dy[i] * w[i] * x[i] * rms
     float dot = 0.f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float dyi = __bfloat162float(dyr[i]);
@@ -135,7 +161,8 @@ __global__ void k_rms_norm_bwd(
         float x_hat   = xi * rms;
         float dxi     = rms * wi * (dyi - x_hat * dot);
         dxr[i]        = __float2bfloat16(dxi);
-        // dw: accumulate in global F32 (atomicAdd across rows)
+        
+        // Use standard atomicAdd for float
         atomicAdd(&dw[i], dyi * x_hat);
     }
 }
@@ -155,13 +182,11 @@ void rms_norm_bwd(
 // ─────────────────────────────────────────────────────────────
 //  RoPE forward
 // ─────────────────────────────────────────────────────────────
-// Rotate pairs (x[2i], x[2i+1]) by angle pos * theta^(-2i/head_dim).
 
 __global__ void k_rope(
     __nv_bfloat16* __restrict__ x,
     int T, int H, int hd, float theta, bool inverse)
 {
-    // Grid: [B, T, H], threads over hd/2
     int b   = blockIdx.z;
     int t   = blockIdx.y;
     int h   = blockIdx.x;
@@ -198,32 +223,26 @@ void rope_bwd(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Scaled dot-product attention — naive, O(T^2)
+//  Scaled dot-product attention
 // ─────────────────────────────────────────────────────────────
-// GQA: each KV head serves (Hq / Hkv) Q heads.
 
 __global__ void k_sdpa_fwd(
-    const __nv_bfloat16* __restrict__ Q,    // [B, T, Hq, hd]
-    const __nv_bfloat16* __restrict__ K,    // [B, T, Hkv, hd]
-    const __nv_bfloat16* __restrict__ V,    // [B, T, Hkv, hd]
-    __nv_bfloat16* __restrict__       out,  // [B, T, Hq, hd]
-    float*         __restrict__       attn, // [B, Hq, T, T]
+    const __nv_bfloat16* __restrict__ Q,    
+    const __nv_bfloat16* __restrict__ K,    
+    const __nv_bfloat16* __restrict__ V,    
+    __nv_bfloat16* __restrict__       out,  
+    float* __restrict__       attn, 
     int T, int Hq, int Hkv, int hd)
 {
-    // One block per (b, hq, tq) triple, threads over tk.
     int b  = blockIdx.z;
     int hq = blockIdx.y;
     int tq = blockIdx.x;
     int hkv = hq / (Hq / Hkv);
 
     float scale = rsqrtf((float)hd);
-
-    // Q row for this query token.
     const __nv_bfloat16* Qrow = Q + (b * T * Hq + tq * Hq + hq) * hd;
+    extern __shared__ float smem[]; 
 
-    extern __shared__ float smem[]; // [T] score buffer
-
-    // Compute attention scores for all keys t <= tq (causal).
     float row_max = -FLT_MAX;
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         const __nv_bfloat16* Krow = K + (b * T * Hkv + tk * Hkv + hkv) * hd;
@@ -234,13 +253,11 @@ __global__ void k_sdpa_fwd(
         smem[tk] = dot * scale;
         row_max = fmaxf(row_max, smem[tk]);
     }
-    // Mask future positions.
     for (int tk = tq + 1 + threadIdx.x; tk < T; tk += blockDim.x) {
         smem[tk] = -1e38f;
     }
     __syncthreads();
 
-    // Reduce max across block.
     __shared__ float smax;
     if (threadIdx.x == 0) {
         float mx = -FLT_MAX;
@@ -250,7 +267,6 @@ __global__ void k_sdpa_fwd(
     __syncthreads();
     float mx = smax;
 
-    // Softmax numerator + denominator.
     float sum = 0.f;
     for (int tk = threadIdx.x; tk < T; tk += blockDim.x) {
         smem[tk] = expf(smem[tk] - mx);
@@ -266,7 +282,6 @@ __global__ void k_sdpa_fwd(
     __syncthreads();
     float inv_sum = 1.f / ssum;
 
-    // Normalise and save attention weights.
     int attn_row = (b * Hq + hq) * T * T + tq * T;
     for (int tk = threadIdx.x; tk < T; tk += blockDim.x) {
         float aw = smem[tk] * inv_sum;
@@ -275,7 +290,6 @@ __global__ void k_sdpa_fwd(
     }
     __syncthreads();
 
-    // Weighted sum of V.
     __nv_bfloat16* outrow = out + (b * T * Hq + tq * Hq + hq) * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float acc = 0.f;
@@ -304,7 +318,7 @@ __global__ void k_sdpa_bwd(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
-    const float*         __restrict__ attn_w,
+    const float* __restrict__ attn_w,
     __nv_bfloat16* __restrict__       dQ,
     __nv_bfloat16* __restrict__       dK,
     __nv_bfloat16* __restrict__       dV,
@@ -320,14 +334,12 @@ __global__ void k_sdpa_bwd(
     const __nv_bfloat16* dO = dout + (b * T * Hq + tq * Hq + hq) * hd;
     const __nv_bfloat16* Qr = Q    + (b * T * Hq + tq * Hq + hq) * hd;
 
-    extern __shared__ float smem[]; // [T] for dS
+    extern __shared__ float smem[]; 
 
-    // dA[tk] = dot(dO, V[tk])
-    float dAq = 0.f; // = sum_i dO[i] * y[i], y = attn*V
+    float dAq = 0.f; 
     for (int i = 0; i < hd; i++) {
         float doi = __bfloat162float(dO[i]);
         float yi  = 0.f;
-        // y[i] = sum_k A[k] * V[k,i]
         for (int tk2 = 0; tk2 <= tq; tk2++) {
             const __nv_bfloat16* Vr2 = V + (b * T * Hkv + tk2 * Hkv + hkv) * hd;
             yi += A[tk2] * __bfloat162float(Vr2[i]);
@@ -337,26 +349,23 @@ __global__ void k_sdpa_bwd(
 
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         const __nv_bfloat16* Vr = V + (b * T * Hkv + tk * Hkv + hkv) * hd;
-        // dA_raw[tk] = dot(dO, V[tk])
         float dA_raw = 0.f;
         for (int i = 0; i < hd; i++) {
             dA_raw += __bfloat162float(dO[i]) * __bfloat162float(Vr[i]);
         }
-        // Softmax backward: dS[tk] = A[tk] * (dA_raw - dAq)
         smem[tk] = A[tk] * (dA_raw - dAq);
     }
     __syncthreads();
 
-    // dV[tk,i] += A[tq,tk] * dO[i]
+    // dV atomic accumulation
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         __nv_bfloat16* dVr = dV + (b * T * Hkv + tk * Hkv + hkv) * hd;
         for (int i = 0; i < hd; i++) {
-            atomicAdd((__nv_bfloat16*)dVr + i,
-                __float2bfloat16(A[tk] * __bfloat162float(dO[i])));
+            // FIXED: use our safe BF16 atomic shim
+            atomic_add_bf16(dVr + i, __float2bfloat16(A[tk] * __bfloat162float(dO[i])));
         }
     }
 
-    // dQ[tq,i] += sum_k dS[k] * K[k,i] * scale
     __nv_bfloat16* dQr = dQ + (b * T * Hq + tq * Hq + hq) * hd;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float acc = 0.f;
@@ -367,12 +376,13 @@ __global__ void k_sdpa_bwd(
         dQr[i] = __float2bfloat16(__bfloat162float(dQr[i]) + acc * scale);
     }
 
-    // dK[tk,i] += dS[tk] * Q[tq,i] * scale
+    // dK atomic accumulation
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         __nv_bfloat16* dKr = dK + (b * T * Hkv + tk * Hkv + hkv) * hd;
         for (int i = 0; i < hd; i++) {
             float dki = smem[tk] * __bfloat162float(Qr[i]) * scale;
-            atomicAdd((__nv_bfloat16*)dKr + i, __float2bfloat16(dki));
+            // FIXED: use our safe BF16 atomic shim
+            atomic_add_bf16(dKr + i, __float2bfloat16(dki));
         }
     }
 }
@@ -405,7 +415,7 @@ __global__ void k_silu_mul_fwd(
     if (i >= N) return;
     float g = __bfloat162float(gate[i]);
     float u = __bfloat162float(up[i]);
-    float s = g / (1.f + expf(-g)); // silu(g)
+    float s = g / (1.f + expf(-g)); 
     out[i]  = __float2bfloat16(s * u);
 }
 
@@ -425,7 +435,7 @@ __global__ void k_silu_mul_bwd(
 
     float sig = 1.f / (1.f + expf(-g));
     float s   = g * sig;
-    float ds  = sig * (1.f + g * (1.f - sig)); // d silu(g) / dg
+    float ds  = sig * (1.f + g * (1.f - sig)); 
 
     dgate[i] = __float2bfloat16(do_ * u * ds);
     dup[i]   = __float2bfloat16(do_ * s);
@@ -452,23 +462,21 @@ void silu_mul_bwd(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Cross-entropy loss (fused forward + dlogits)
+//  Cross-entropy loss
 // ─────────────────────────────────────────────────────────────
-// One block per token. Threads reduce over vocab V.
 
 __global__ void k_cross_entropy(
-    const __nv_bfloat16* __restrict__ logits,  // [N, V]
-    const int*           __restrict__ targets, // [N]
-    float*               __restrict__ loss_per_token, // [N]
-    __nv_bfloat16*       __restrict__ dlogits, // [N, V]
+    const __nv_bfloat16* __restrict__ logits, 
+    const int* __restrict__ targets, 
+    float* __restrict__ loss_per_token, 
+    __nv_bfloat16* __restrict__ dlogits, 
     int V)
 {
     int n = blockIdx.x;
     const __nv_bfloat16* L = logits  + n * V;
-    __nv_bfloat16*       dL = dlogits + n * V;
+    __nv_bfloat16* dL = dlogits + n * V;
     int tgt = targets[n];
 
-    // Find max for numerical stability.
     float mx = -FLT_MAX;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
         mx = fmaxf(mx, __bfloat162float(L[i]));
@@ -487,7 +495,6 @@ __global__ void k_cross_entropy(
     __syncthreads();
     mx = smem[0];
 
-    // Sum of exp(logit - max).
     float sum = 0.f;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
         sum += expf(__bfloat162float(L[i]) - mx);
@@ -508,7 +515,6 @@ __global__ void k_cross_entropy(
     __syncthreads();
     float log_sum = smem[0];
 
-    // dlogits[i] = softmax[i] - (i == tgt ? 1 : 0), scaled by 1/N.
     float inv_N = 1.f / (float)gridDim.x;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
         float p = expf(__bfloat162float(L[i]) - log_sum);
@@ -522,7 +528,6 @@ void cross_entropy_fwd(
     float* loss_out, __nv_bfloat16* dlogits,
     int N, int V, cudaStream_t s)
 {
-    // loss_out is [N] per-token losses; caller averages.
     int threads = min(((V + WARP - 1) / WARP) * WARP, 1024);
     k_cross_entropy<<<N, threads, 0, s>>>(logits, targets, loss_out, dlogits, V);
 }
@@ -538,7 +543,7 @@ __global__ void k_embed_fwd(
     int bt = blockIdx.x;
     int tok = tokens[bt];
     const __nv_bfloat16* row = table + tok * D;
-    __nv_bfloat16*       dst = out   + bt  * D;
+    __nv_bfloat16* dst = out   + bt  * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x)
         dst[i] = row[i];
 }
@@ -550,8 +555,9 @@ __global__ void k_embed_bwd(
     int bt  = blockIdx.x;
     int tok = tokens[bt];
     const __nv_bfloat16* src = dout   + bt  * D;
-    float*               dst = dtable + tok * D;
+    float* dst = dtable + tok * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x)
+        // Standard atomicAdd for float* - works because we renamed the bf16 one
         atomicAdd(&dst[i], __bfloat162float(src[i]));
 }
 

@@ -137,8 +137,9 @@ int main(int argc, char** argv) {
                   << " layers=" << base.config.num_layers
                   << " hidden=" << base.config.hidden_size << "\n";
 
-        // 3. Derive adapter config from base.
-        auto cfg = AdapterConfig::for_base(base);
+        // 3. Derive adapter config from base + available VRAM.
+        //    Called after model load so free-memory query reflects the real budget.
+        auto cfg = AdapterConfig::for_base(base, dev);
         std::cerr << "[tensor-adapt] rank=" << cfg.rank
                   << " alpha=" << cfg.alpha
                   << " lr=" << cfg.lr
