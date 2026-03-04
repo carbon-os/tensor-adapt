@@ -1,3 +1,4 @@
+// adapt_trainer.cu
 #include <tensor/trainer/adapt_trainer.hpp>
 #include <tensor/trainer/adamw.hpp>
 #include <tensor/trainer/cosine_schedule.hpp>
@@ -23,17 +24,15 @@ using namespace base::arch;
 namespace ops = backend::cuda::ops;
 
 // ─────────────────────────────────────────────────────────────
-//  Gradient norm
+//  Gradient norm + clip
 // ─────────────────────────────────────────────────────────────
 
 static float compute_grad_norm(const AdapterModel& model, const Device& dev) {
     float norm_sq = 0.f;
     for (const auto& la : model.layers) {
         for (const auto* lp : {&la.lora_q, &la.lora_k, &la.lora_v, &la.lora_o}) {
-            auto gA = lp->gA.to_host_f32();
-            auto gB = lp->gB.to_host_f32();
-            for (float g : gA) norm_sq += g * g;
-            for (float g : gB) norm_sq += g * g;
+            for (float g : lp->gA.to_host_f32()) norm_sq += g * g;
+            for (float g : lp->gB.to_host_f32()) norm_sq += g * g;
         }
     }
     return std::sqrt(norm_sq);
@@ -53,8 +52,10 @@ static void clip_gradients(AdapterModel& model, float max_norm,
         for (auto* lp : {&la.lora_q, &la.lora_k, &la.lora_v, &la.lora_o}) {
             int nA = lp->rank * lp->in_dim;
             int nB = lp->out_dim * lp->rank;
-            k_grad_scale<<<(nA+255)/256, 256, 0, dev.stream()>>>(lp->gA.f32(), nA, scale);
-            k_grad_scale<<<(nB+255)/256, 256, 0, dev.stream()>>>(lp->gB.f32(), nB, scale);
+            k_grad_scale<<<(nA+255)/256, 256, 0, dev.stream()>>>(
+                lp->gA.f32(), nA, scale);
+            k_grad_scale<<<(nB+255)/256, 256, 0, dev.stream()>>>(
+                lp->gB.f32(), nB, scale);
         }
     }
 }
@@ -72,10 +73,8 @@ struct TensorStats {
 static TensorStats compute_stats_f32(const std::vector<float>& v) {
     TensorStats s{};
     if (v.empty()) return s;
-
     s.mn = s.mx = v[0];
     double sum = 0.0, sum_sq = 0.0;
-
     for (float x : v) {
         if (std::isnan(x)) { s.nan_count++; continue; }
         if (std::isinf(x)) { s.inf_count++; continue; }
@@ -84,7 +83,6 @@ static TensorStats compute_stats_f32(const std::vector<float>& v) {
         sum    += x;
         sum_sq += (double)x * x;
     }
-
     std::size_t valid = v.size() - s.nan_count - s.inf_count;
     if (valid > 0) {
         s.mean    = (float)(sum / valid);
@@ -94,66 +92,55 @@ static TensorStats compute_stats_f32(const std::vector<float>& v) {
     return s;
 }
 
-// Pull a BF16 device tensor to host as F32 and compute stats.
-static TensorStats bf16_tensor_stats(
-    const Tensor& t, const Device& dev, int max_elements = -1)
+static TensorStats bf16_tensor_stats(const Tensor& t, const Device& dev,
+                                     int max_elements = -1)
 {
     int n = (max_elements > 0)
         ? std::min((int)t.numel(), max_elements)
         : (int)t.numel();
-
     Tensor f32 = Tensor::empty_f32({(std::size_t)n}, dev);
     ops::cast_bf16_to_f32(t.bf16(), f32.f32(), n, dev.stream());
     dev.sync();
-    auto h = f32.to_host_f32();
-    return compute_stats_f32(h);
+    return compute_stats_f32(f32.to_host_f32());
 }
 
 static void print_stats(const char* name, const TensorStats& s) {
     std::cerr << "[debug] " << name
-              << ": min=" << s.mn
-              << " max=" << s.mx
-              << " mean=" << s.mean
-              << " std=" << s.std_dev;
+              << ": min=" << s.mn << " max=" << s.mx
+              << " mean=" << s.mean << " std=" << s.std_dev;
     if (s.nan_count) std::cerr << " NAN=" << s.nan_count;
     if (s.inf_count) std::cerr << " INF=" << s.inf_count;
     if (s.all_zero)  std::cerr << " *** ALL ZERO ***";
     std::cerr << "\n";
 }
 
-// Full diagnostic dump — called on step 1 and whenever loss is anomalous.
-static void run_diagnostics(
-    const Qwen2ForwardResult& fwd,
-    const std::vector<int32_t>& targets,
-    const base::BaseConfig& bc,
-    int BT,
-    const Device& dev)
+static void run_diagnostics(const Qwen2ForwardResult& fwd,
+                             const std::vector<int32_t>& targets,
+                             const base::BaseConfig& bc,
+                             int BT, const Device& dev)
 {
     std::cerr << "\n[diag] ════════ Forward pass diagnostic ════════\n";
 
-    // ── Logits ───────────────────────────────────────────────
     {
         auto s = bf16_tensor_stats(fwd.logits, dev, BT * 256);
         print_stats("logits (sample)", s);
 
         Tensor row_f32 = Tensor::empty_f32({(std::size_t)bc.vocab_size}, dev);
-        ops::cast_bf16_to_f32(fwd.logits.bf16(), row_f32.f32(), bc.vocab_size, dev.stream());
+        ops::cast_bf16_to_f32(fwd.logits.bf16(), row_f32.f32(),
+                              bc.vocab_size, dev.stream());
         dev.sync();
         auto row = row_f32.to_host_f32();
         auto rs  = compute_stats_f32(row);
         print_stats("logits[token0] full vocab", rs);
 
-        // Manual argmax — std::max_element unavailable in nvcc translation unit
-        int   argmax    = 0;
-        float argmax_v  = row[0];
-        for (int i = 1; i < (int)row.size(); i++) {
+        int argmax = 0; float argmax_v = row[0];
+        for (int i = 1; i < (int)row.size(); i++)
             if (row[i] > argmax_v) { argmax_v = row[i]; argmax = i; }
-        }
         std::cerr << "[diag] logits[token0] argmax=" << argmax
                   << " logit=" << argmax_v << "\n";
 
         if (!targets.empty()) {
-            int   tgt      = targets[0];
+            int tgt = targets[0];
             float tgt_logit = (tgt < (int)row.size()) ? row[tgt] : -999.f;
             std::cerr << "[diag] target[0]=" << tgt
                       << " target_logit=" << tgt_logit
@@ -161,7 +148,6 @@ static void run_diagnostics(
                       << " gap=" << (argmax_v - tgt_logit) << "\n";
         }
 
-        // Softmax entropy of first token
         float sum_exp = 0.f;
         for (float v : row) sum_exp += std::exp(v - argmax_v);
         float log_sum = std::log(sum_exp) + argmax_v;
@@ -176,13 +162,8 @@ static void run_diagnostics(
                   << " (" << (100.f * entropy / max_entropy) << "% of uniform)\n";
     }
 
-    // ── Embed output ─────────────────────────────────────────
-    {
-        auto s = bf16_tensor_stats(fwd.embed_in, dev);
-        print_stats("embed_in", s);
-    }
+    print_stats("embed_in", bf16_tensor_stats(fwd.embed_in, dev));
 
-    // ── Layer 0 cache ─────────────────────────────────────────
     if (!fwd.layer_cache.empty()) {
         const auto& lc0 = fwd.layer_cache[0];
         print_stats("layer0.x_normed",  bf16_tensor_stats(lc0.x_normed,  dev));
@@ -197,20 +178,15 @@ static void run_diagnostics(
         print_stats("layer0.act_out",   bf16_tensor_stats(lc0.act_out,   dev));
         print_stats("layer0.ffn_out",   bf16_tensor_stats(lc0.ffn_out,   dev));
     }
-
-    // ── Last layer cache ──────────────────────────────────────
     if (fwd.layer_cache.size() > 1) {
         const auto& lcN = fwd.layer_cache.back();
         print_stats("layerN.x_normed", bf16_tensor_stats(lcN.x_normed, dev));
         print_stats("layerN.attn_out", bf16_tensor_stats(lcN.attn_out, dev));
         print_stats("layerN.ffn_out",  bf16_tensor_stats(lcN.ffn_out,  dev));
     }
-
-    // ── Final RMS ─────────────────────────────────────────────
     {
         dev.sync();
-        auto rms = fwd.final_rms.to_host_f32();
-        auto s   = compute_stats_f32(rms);
+        auto s = compute_stats_f32(fwd.final_rms.to_host_f32());
         print_stats("final_rms_values", s);
     }
 
@@ -234,9 +210,9 @@ struct AdaptTrainer::Impl {
     centroid::CentroidAccumulator centroid_acc;
     checkpoint::AdapterWriter     writer;
 
-    std::size_t step_count     = 0;
-    std::size_t tokens_seen    = 0;
-    std::size_t total_steps    = 0;
+    std::size_t step_count  = 0;
+    std::size_t tokens_seen = 0;
+    std::size_t total_steps = 0;
 
     Impl(const FrozenBase* b, const AdapterConfig& c,
          data::Dataset* ds, const AdaptOptions& o, const Device* d)
@@ -246,12 +222,8 @@ struct AdaptTrainer::Impl {
         , centroid_acc(b->config.hidden_size, o.output_dir + "/centroids")
         , writer(o.output_dir)
     {
-        std::size_t steps_per_epoch =
-            opts.tokens / (cfg.batch_size * cfg.seq_len);
-        total_steps = steps_per_epoch;
-
-        schedule = CosineSchedule{
-            cfg.lr, cfg.warmup_steps, total_steps, 0.1f};
+        total_steps = opts.tokens / (cfg.batch_size * cfg.seq_len);
+        schedule    = CosineSchedule{cfg.lr, cfg.warmup_steps, total_steps, 0.1f};
 
         std::cerr << "[trainer] LoRA params=" << model.param_count()
                   << " total_steps=" << total_steps
@@ -269,22 +241,18 @@ struct AdaptTrainer::Impl {
         auto [input_ids, target_ids] = dataset->next_batch(B, T);
 
         Tensor tok_dev = Tensor::from_host(
-            core::TensorView{input_ids.data(), core::DType::I32,
-                             {(std::size_t)BT}},
-            *dev);
+            core::TensorView{input_ids.data(),  core::DType::I32, {(std::size_t)BT}}, *dev);
         Tensor tgt_dev = Tensor::from_host(
-            core::TensorView{target_ids.data(), core::DType::I32,
-                             {(std::size_t)BT}},
-            *dev);
+            core::TensorView{target_ids.data(), core::DType::I32, {(std::size_t)BT}}, *dev);
 
-        // ── 2. Zero gradients ─────────────────────────────────
+        // ── 2. Zero gradients ──────────────────────────────────
         model.zero_grad(*dev);
 
-        // ── 3. Forward pass ───────────────────────────────────
+        // ── 3. Forward ────────────────────────────────────────
         auto fwd = Qwen2Base::forward(*base, tok_dev, B, T, *dev);
         dev->sync();
 
-        // ── 4. Diagnostic dump — step 1 only ─────────────────
+        // ── 4. Step-1 diagnostics ─────────────────────────────
         if (step_count == 0) {
             std::cerr << "[diag] input token IDs (first 16): ";
             for (int i = 0; i < std::min(16, BT); i++)
@@ -295,9 +263,7 @@ struct AdaptTrainer::Impl {
                 std::cerr << target_ids[i] << " ";
             std::cerr << "\n";
             std::cerr << "[diag] vocab_size=" << bc.vocab_size
-                      << " hidden=" << bc.hidden_size
-                      << " BT=" << BT << "\n";
-
+                      << " hidden=" << bc.hidden_size << " BT=" << BT << "\n";
             run_diagnostics(fwd, target_ids, bc, BT, *dev);
         }
 
@@ -314,7 +280,6 @@ struct AdaptTrainer::Impl {
         for (float l : loss_h) mean_loss += l;
         mean_loss /= (float)BT;
 
-        // Flag anomalous loss — dump diagnostics if it spikes after step 1.
         if (step_count > 0 && (std::isnan(mean_loss) || mean_loss > 20.f)) {
             std::cerr << "[diag] anomalous loss=" << mean_loss
                       << " at step=" << step_count << "\n";
@@ -329,40 +294,55 @@ struct AdaptTrainer::Impl {
             LayerAdapter& la = model.layers[l];
             const auto& lc  = fwd.layer_cache[l];
 
+            // ── LoRA backward with correct upstream gradients ──
+            //
+            // apply_lora_bwd(lp, x, grad_out, grad_x, BT, dev) expects:
+            //   x        — the input that was fed into the projection in the fwd pass
+            //   grad_out — gradient w.r.t. the projection's OUTPUT
+            //
+            // Previously the code passed dx_attn_in (gradient w.r.t. the
+            // projection INPUT, i.e. x_normed) as grad_out for Q/K/V, and
+            // dx_o_in (gradient w.r.t. attn_out = o_proj INPUT) for O.
+            // Both were wrong: they sent the gradient one step too far
+            // through the projection, giving the LoRA adapters incorrect
+            // and noisy weight updates.
+            //
+            // Correct sources:
+            //   lora_q → dQ  (post sdpa_bwd + rope_bwd, pre q_proj_bwd)
+            //   lora_k → dK  (post sdpa_bwd + rope_bwd, pre k_proj_bwd)
+            //   lora_v → dV  (post sdpa_bwd, pre v_proj_bwd)
+            //   lora_o → do_proj (= grad flowing into h_mid, o_proj output)
+
             Tensor dummy_gx = Tensor::zeros(
                 {(std::size_t)BT, (std::size_t)bc.hidden_size},
                 core::DType::BF16, *dev);
 
-            model.apply_lora_bwd(la.lora_q, lc.x_normed, lg.dx_attn_in,
-                                  dummy_gx, BT, *dev);
-            model.apply_lora_bwd(la.lora_k, lc.x_normed, lg.dx_attn_in,
-                                  dummy_gx, BT, *dev);
-            model.apply_lora_bwd(la.lora_v, lc.x_normed, lg.dx_attn_in,
-                                  dummy_gx, BT, *dev);
-            model.apply_lora_bwd(la.lora_o, lc.attn_out, lg.dx_o_in,
-                                  dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_q, lc.x_normed,  lg.dQ,      dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_k, lc.x_normed,  lg.dK,      dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_v, lc.x_normed,  lg.dV,      dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_o, lc.attn_out,  lg.do_proj, dummy_gx, BT, *dev);
 
+            // Centroid: accumulate normed activations weighted by their
+            // gradient signal (still uses dx_attn_in, which is the correct
+            // signal for identifying which directions in x_normed-space
+            // most affect the loss).
             centroid_acc.accumulate(lc.x_normed, lg.dx_attn_in, *dev);
         }
 
-        // ── 7. Grad norm + clip ───────────────────────────────
+        // ── 7. Grad norm + clip ────────────────────────────────
         dev->sync();
         float gnorm = compute_grad_norm(model, *dev);
 
-        // Log gradient stats on step 1.
         if (step_count == 0) {
             std::cerr << "[diag] grad_norm before clip=" << gnorm << "\n";
-            // Check first layer's gB — should be non-zero even at init
-            // because B is zero but gB accumulates from the backward path.
             auto gB0 = model.layers[0].lora_q.gB.to_host_f32();
-            auto gs  = compute_stats_f32(gB0);
-            print_stats("layer0.lora_q.gB (post-bwd)", gs);
+            print_stats("layer0.lora_q.gB (post-bwd)", compute_stats_f32(gB0));
         }
 
         clip_gradients(model, cfg.grad_clip, gnorm, *dev);
         gnorm = std::min(gnorm, cfg.grad_clip);
 
-        // ── 8. Optimizer step ─────────────────────────────────
+        // ── 8. Optimizer step ──────────────────────────────────
         float lr = schedule.lr_at(step_count);
         optimizer.step_all(model, lr, (int)step_count + 1, *dev);
         dev->sync();
@@ -370,14 +350,13 @@ struct AdaptTrainer::Impl {
         step_count++;
         tokens_seen += BT;
 
-        // ── 9. Checkpoint ─────────────────────────────────────
+        // ── 9. Checkpoint ──────────────────────────────────────
         if (step_count % opts.checkpoint_every == 0) {
-            std::string ckpt_dir = opts.output_dir + "/step-" +
-                                   std::to_string(step_count);
+            std::string ckpt = opts.output_dir + "/step-" + std::to_string(step_count);
             centroid_acc.write_snapshot(step_count);
-            writer.save_checkpoint(model, *base, opts.domain, step_count,
-                                   tokens_seen, ckpt_dir);
-            std::cerr << "[trainer] checkpoint → " << ckpt_dir << "\n";
+            writer.save_checkpoint(model, *base, opts.domain,
+                                   step_count, tokens_seen, ckpt);
+            std::cerr << "[trainer] checkpoint → " << ckpt << "\n";
         }
 
         return StepMetrics{step_count, tokens_seen, mean_loss, lr, gnorm};
@@ -385,32 +364,20 @@ struct AdaptTrainer::Impl {
 };
 
 AdaptTrainer AdaptTrainer::create(
-    const FrozenBase&       base,
-    const AdapterConfig&    cfg,
-    data::Dataset&          dataset,
-    const AdaptOptions&     opts,
-    const Device&           dev)
+    const FrozenBase& base, const AdapterConfig& cfg,
+    data::Dataset& dataset, const AdaptOptions& opts, const Device& dev)
 {
     fs::create_directories(opts.output_dir);
-    auto impl = std::make_unique<Impl>(&base, cfg, &dataset, opts, &dev);
-    return AdaptTrainer(std::move(impl));
+    return AdaptTrainer(std::make_unique<Impl>(&base, cfg, &dataset, opts, &dev));
 }
 
-AdaptTrainer::AdaptTrainer(std::unique_ptr<Impl> impl)
-    : impl_(std::move(impl)) {}
-
+AdaptTrainer::AdaptTrainer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 AdaptTrainer::~AdaptTrainer() = default;
-
 AdaptTrainer::AdaptTrainer(AdaptTrainer&&) noexcept = default;
 AdaptTrainer& AdaptTrainer::operator=(AdaptTrainer&&) noexcept = default;
 
-bool AdaptTrainer::done() const {
-    return impl_->tokens_seen >= impl_->opts.tokens;
-}
-
-StepMetrics AdaptTrainer::step() {
-    return impl_->do_step();
-}
+bool        AdaptTrainer::done() const { return impl_->tokens_seen >= impl_->opts.tokens; }
+StepMetrics AdaptTrainer::step()       { return impl_->do_step(); }
 
 void AdaptTrainer::run() {
     while (!done()) {

@@ -1,9 +1,10 @@
+// base_loader.cpp
 #include <tensor/base/base_loader.hpp>
 #include <tensor/base/frozen_base.hpp>
 #include <tensor/parser/config.hpp>
 #include <tensor/parser/weight_map.hpp>
 
-#include <openssl/sha.h>  // for base_sha computation
+#include <openssl/sha.h>
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
@@ -22,25 +23,21 @@ static ArchType detect_arch(const std::string& model_type, const std::string& hi
     std::string s = hint.empty() ? model_type : hint;
     if (s == "qwen2") return ArchType::Qwen2;
     if (s == "llama") return ArchType::LLaMA;
-    // Fallback: partial match
     if (s.find("qwen") != std::string::npos) return ArchType::Qwen2;
     if (s.find("llama") != std::string::npos) return ArchType::LLaMA;
     return ArchType::Unknown;
 }
 
 static std::string sha256_dir(const std::string& dir) {
-    // Simple: hash all .safetensors filenames + sizes (not full content).
     std::vector<fs::path> files;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.path().extension() == ".safetensors") {
+        if (e.path().extension() == ".safetensors")
             files.push_back(e.path());
-        }
     }
     std::sort(files.begin(), files.end());
     std::ostringstream oss;
-    for (const auto& f : files) {
+    for (const auto& f : files)
         oss << f.filename().string() << ":" << fs::file_size(f) << ";";
-    }
     std::string content = oss.str();
 
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -48,28 +45,24 @@ static std::string sha256_dir(const std::string& dir) {
            content.size(), hash);
 
     std::ostringstream hex;
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
         hex << std::hex << std::setw(2) << std::setfill('0')
             << static_cast<int>(hash[i]);
-    }
     return hex.str();
 }
 
-// Upload a TensorView (BF16 or F32) to device as BF16.
 static Tensor upload_bf16(
     const TensorView& tv, const Device& dev, const std::string& name)
 {
-    if (tv.dtype == core::DType::BF16) {
+    if (tv.dtype == core::DType::BF16)
         return Tensor::from_host(tv, dev);
-    }
-    // F32 → BF16: convert on host, then upload.
+
     if (tv.dtype == core::DType::F32) {
         std::size_t n = tv.numel();
         std::vector<__nv_bfloat16> buf(n);
         const float* src = static_cast<const float*>(tv.data);
-        for (std::size_t i = 0; i < n; i++) {
+        for (std::size_t i = 0; i < n; i++)
             buf[i] = __float2bfloat16(src[i]);
-        }
         core::TensorView bfv;
         bfv.data  = buf.data();
         bfv.dtype = core::DType::BF16;
@@ -96,9 +89,8 @@ FrozenBase BaseLoader::load(
     bc.arch      = detect_arch(bc.arch_name, arch_hint);
     bc.base_sha  = sha256_dir(dir);
 
-    if (bc.arch == ArchType::Unknown) {
+    if (bc.arch == ArchType::Unknown)
         throw BaseError("unknown architecture: " + bc.arch_name);
-    }
 
     bc.vocab_size        = cfg.vocab_size();
     bc.hidden_size       = cfg.hidden_size();
@@ -116,11 +108,11 @@ FrozenBase BaseLoader::load(
               << " heads=" << bc.num_q_heads << "/" << bc.num_kv_heads
               << " intermediate=" << bc.intermediate_size << "\n";
 
-    // ── embeddings ───────────────────────────────────────────
+    // ── Embeddings ────────────────────────────────────────────
     base.embed_w = upload_bf16(
         wm.tensor("model.embed_tokens.weight"), dev, "embed_tokens");
 
-    // ── transformer layers ───────────────────────────────────
+    // ── Transformer layers ────────────────────────────────────
     base.layers.reserve(bc.num_layers);
     for (std::size_t l = 0; l < bc.num_layers; l++) {
         auto p = [&](const std::string& k) {
@@ -128,32 +120,50 @@ FrozenBase BaseLoader::load(
         };
 
         LayerWeights lw;
-        lw.input_norm_w = upload_bf16(wm.tensor(p("input_layernorm.weight")),          dev, p("in_norm"));
-        lw.q_proj_w     = upload_bf16(wm.tensor(p("self_attn.q_proj.weight")),         dev, p("q_proj"));
-        lw.k_proj_w     = upload_bf16(wm.tensor(p("self_attn.k_proj.weight")),         dev, p("k_proj"));
-        lw.v_proj_w     = upload_bf16(wm.tensor(p("self_attn.v_proj.weight")),         dev, p("v_proj"));
-        lw.o_proj_w     = upload_bf16(wm.tensor(p("self_attn.o_proj.weight")),         dev, p("o_proj"));
-        lw.post_norm_w  = upload_bf16(wm.tensor(p("post_attention_layernorm.weight")), dev, p("post_norm"));
-        lw.gate_proj_w  = upload_bf16(wm.tensor(p("mlp.gate_proj.weight")),            dev, p("gate_proj"));
-        lw.up_proj_w    = upload_bf16(wm.tensor(p("mlp.up_proj.weight")),              dev, p("up_proj"));
-        lw.down_proj_w  = upload_bf16(wm.tensor(p("mlp.down_proj.weight")),            dev, p("down_proj"));
+
+        lw.input_norm_w = upload_bf16(
+            wm.tensor(p("input_layernorm.weight")), dev, p("in_norm"));
+
+        // ── Attention weights + QKV biases ────────────────────
+        //
+        // Qwen2 retains learned biases on Q, K, and V projections.
+        // These shift the projected values before RoPE is applied,
+        // giving the model more freedom to represent relative positions.
+        // Loading them is mandatory: without the bias the model produces
+        // completely wrong key/query/value vectors, and loss diverges
+        // far above the uniform-random ceiling of ln(vocab_size) ≈ 11.9.
+        lw.q_proj_w = upload_bf16(wm.tensor(p("self_attn.q_proj.weight")), dev, p("q_w"));
+        lw.q_proj_b = upload_bf16(wm.tensor(p("self_attn.q_proj.bias")),   dev, p("q_b"));
+
+        lw.k_proj_w = upload_bf16(wm.tensor(p("self_attn.k_proj.weight")), dev, p("k_w"));
+        lw.k_proj_b = upload_bf16(wm.tensor(p("self_attn.k_proj.bias")),   dev, p("k_b"));
+
+        lw.v_proj_w = upload_bf16(wm.tensor(p("self_attn.v_proj.weight")), dev, p("v_w"));
+        lw.v_proj_b = upload_bf16(wm.tensor(p("self_attn.v_proj.bias")),   dev, p("v_b"));
+
+        // O projection — no bias in Qwen2.
+        lw.o_proj_w = upload_bf16(wm.tensor(p("self_attn.o_proj.weight")), dev, p("o_w"));
+
+        lw.post_norm_w = upload_bf16(
+            wm.tensor(p("post_attention_layernorm.weight")), dev, p("post_norm"));
+
+        // MLP — no bias on any projection in Qwen2.
+        lw.gate_proj_w = upload_bf16(wm.tensor(p("mlp.gate_proj.weight")), dev, p("gate"));
+        lw.up_proj_w   = upload_bf16(wm.tensor(p("mlp.up_proj.weight")),   dev, p("up"));
+        lw.down_proj_w = upload_bf16(wm.tensor(p("mlp.down_proj.weight")), dev, p("down"));
 
         base.layers.push_back(std::move(lw));
 
-        if ((l + 1) % 4 == 0) {
+        if ((l + 1) % 4 == 0)
             std::cerr << "[base] loaded " << (l+1) << "/" << bc.num_layers << " layers\r";
-        }
     }
     std::cerr << "\n";
 
     base.final_norm_w = upload_bf16(wm.tensor("model.norm.weight"), dev, "final_norm");
 
-    // LM head — Qwen2 ties lm_head.weight = embed_tokens.weight.
     bc.tie_embeddings = !wm.contains("lm_head.weight");
-    if (!bc.tie_embeddings) {
+    if (!bc.tie_embeddings)
         base.lm_head_w = upload_bf16(wm.tensor("lm_head.weight"), dev, "lm_head");
-    }
-    // lm_head_w left default (empty Tensor) when tied; Qwen2Base will use embed_w.
 
     dev.sync();
     std::cerr << "[base] loaded OK (sha=" << bc.base_sha.substr(0,12) << "...)\n";

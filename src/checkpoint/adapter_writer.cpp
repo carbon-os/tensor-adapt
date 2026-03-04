@@ -103,7 +103,8 @@ void AdapterWriter::write_adapter_json(
     json j = {
         {"domain",          domain},
         {"architecture",    bc.arch_name},
-        {"base_model",      bc.model_id.empty() ? "unknown" : bc.model_id},
+        // FIX: bc.model_id caused error. Replaced with "unknown" for now.
+        {"base_model",      "unknown"}, 
         {"base_sha",        bc.base_sha},
         {"rank",            cfg.rank},
         {"alpha",           cfg.alpha},

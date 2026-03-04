@@ -1,3 +1,4 @@
+// ops.cu
 #include <tensor/backend/cuda/ops.hpp>
 
 #include <cuda_bf16.h>
@@ -8,33 +9,23 @@
 namespace tensor::backend::cuda::ops {
 
 // ─────────────────────────────────────────────────────────────
-//  AtomicAdd Shim for BFloat16
+//  AtomicAdd shim for BF16 on pre-Ampere hardware (sm < 80)
 // ─────────────────────────────────────────────────────────────
-// We rename this to 'atomic_add_bf16' to avoid name collision 
-// with standard CUDA headers and to prevent hiding the float 
-// overloads for other kernels.
 
-__device__ __forceinline__ void atomic_add_bf16(__nv_bfloat16* address, __nv_bfloat16 val) {
+__device__ __forceinline__
+void atomic_add_bf16(__nv_bfloat16* address, __nv_bfloat16 val) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-    // Manual CAS loop for Pascal/Volta/Turing (sm_70 - sm_75)
-    unsigned short* address_as_us = (unsigned short*)address;
-    unsigned short old = *address_as_us, assumed;
-
+    unsigned short* addr = (unsigned short*)address;
+    unsigned short old = *addr, assumed;
     do {
         assumed = old;
-        // 1. Read as bf16
-        // 2. Convert to float
-        // 3. Add
-        // 4. Convert back to bf16
-        float fsum = __bfloat162float(*(__nv_bfloat16*)&assumed) + __bfloat162float(val);
+        float fsum = __bfloat162float(*(__nv_bfloat16*)&assumed)
+                   + __bfloat162float(val);
         __nv_bfloat16 bsum = __float2bfloat16(fsum);
-        unsigned short new_val = *(unsigned short*)&bsum;
-
-        // 5. Compare and Swap
-        old = atomicCAS(address_as_us, assumed, new_val);
+        unsigned short nv  = *(unsigned short*)&bsum;
+        old = atomicCAS(addr, assumed, nv);
     } while (assumed != old);
 #else
-    // Native hardware instruction for Ampere (sm_80) and newer
     atomicAdd(address, val);
 #endif
 }
@@ -67,12 +58,12 @@ __global__ void k_rms_norm_fwd(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
     __nv_bfloat16* __restrict__       out,
-    float* __restrict__       rms_out,
+    float* __restrict__               rms_out,
     int D, float eps)
 {
     int row = blockIdx.x;
-    const __nv_bfloat16* xr = x   + row * D;
-    __nv_bfloat16* or_ = out + row * D;
+    const __nv_bfloat16* xr  = x   + row * D;
+    __nv_bfloat16*       orr = out  + row * D;
 
     float ss = 0.f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
@@ -80,17 +71,16 @@ __global__ void k_rms_norm_fwd(
         ss += xi * xi;
     }
     __shared__ float smem[32];
-    int lane = threadIdx.x % WARP;
-    int wid  = threadIdx.x / WARP;
+    int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
     ss = warp_reduce_sum(ss);
     if (lane == 0) smem[wid] = ss;
     __syncthreads();
     if (wid == 0) {
-        ss = (threadIdx.x < (blockDim.x / WARP)) ? smem[threadIdx.x] : 0.f;
+        ss = (threadIdx.x < blockDim.x / WARP) ? smem[threadIdx.x] : 0.f;
         ss = warp_reduce_sum(ss);
         if (threadIdx.x == 0) {
             float rms = rsqrtf(ss / (float)D + eps);
-            smem[0] = rms;
+            smem[0]      = rms;
             rms_out[row] = rms;
         }
     }
@@ -100,7 +90,7 @@ __global__ void k_rms_norm_fwd(
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float xi = __bfloat162float(xr[i]);
         float wi = __bfloat162float(w[i]);
-        or_[i] = __float2bfloat16(xi * rms * wi);
+        orr[i] = __float2bfloat16(xi * rms * wi);
     }
 }
 
@@ -109,60 +99,83 @@ void rms_norm_fwd(
     __nv_bfloat16* out, float* rms_out,
     int B, int T, int D, float eps, cudaStream_t stream)
 {
-    int rows = B * T;
+    int rows    = B * T;
     int threads = min(((D + WARP - 1) / WARP) * WARP, 1024);
     k_rms_norm_fwd<<<rows, threads, 0, stream>>>(x, w, out, rms_out, D, eps);
 }
 
 // ─────────────────────────────────────────────────────────────
 //  RMSNorm backward
+//
+//  Given y = w * x_hat  where x_hat = x * rms, rms = rsqrt(mean(x²)+ε)
+//
+//  Correct gradient w.r.t. x_i:
+//
+//    dx_i = rms * (w_i * dy_i  −  x_hat_i * dot / D)
+//
+//  where  dot = Σ_j dy_j * w_j * x_hat_j
+//
+//  Common mistake: factoring w_i outside the whole expression gives
+//    rms * w_i * (dy_i − x_hat_i * dot / D)
+//  which wrongly multiplies the correction term by w_i.
+//  This inflates gradients wherever w differs from 1 and compounds
+//  across layers, producing large gradient norms even after the
+//  rms_norm_bwd x-argument bug is fixed.
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_rms_norm_bwd(
     const __nv_bfloat16* __restrict__ dy,
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
-    const float* __restrict__ rms_saved,
-    __nv_bfloat16* __restrict__ dx,
-    float* __restrict__ dw,
+    const float* __restrict__         rms_saved,
+    __nv_bfloat16* __restrict__       dx,
+    float* __restrict__               dw,
     int D, float eps)
 {
     int row = blockIdx.x;
     const __nv_bfloat16* dyr = dy  + row * D;
     const __nv_bfloat16* xr  = x   + row * D;
-    __nv_bfloat16* dxr = dx  + row * D;
+    __nv_bfloat16*       dxr = dx  + row * D;
     float rms = rms_saved[row];
 
+    // Compute dot = Σ dy_j * w_j * x_hat_j  (per thread partial)
     float dot = 0.f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float dyi = __bfloat162float(dyr[i]);
-        float xi  = __bfloat162float(xr[i]);
-        float wi  = __bfloat162float(w[i]);
-        dot += dyi * wi * (xi * rms);
+        float dyi   = __bfloat162float(dyr[i]);
+        float xi    = __bfloat162float(xr[i]);
+        float wi    = __bfloat162float(w[i]);
+        float x_hat = xi * rms;
+        dot += dyi * wi * x_hat;
     }
     __shared__ float smem[32];
-    int lane = threadIdx.x % WARP;
-    int wid  = threadIdx.x / WARP;
+    int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
     dot = warp_reduce_sum(dot);
     if (lane == 0) smem[wid] = dot;
     __syncthreads();
     if (wid == 0) {
-        dot = (threadIdx.x < (blockDim.x / WARP)) ? smem[threadIdx.x] : 0.f;
+        dot = (threadIdx.x < blockDim.x / WARP) ? smem[threadIdx.x] : 0.f;
         dot = warp_reduce_sum(dot);
         if (threadIdx.x == 0) smem[0] = dot;
     }
     __syncthreads();
-    dot = smem[0] / (float)D;
+    // dot/D is the scalar correction subtracted from every position.
+    float correction = smem[0] / (float)D;
 
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float dyi     = __bfloat162float(dyr[i]);
-        float xi      = __bfloat162float(xr[i]);
-        float wi      = __bfloat162float(w[i]);
-        float x_hat   = xi * rms;
-        float dxi     = rms * wi * (dyi - x_hat * dot);
-        dxr[i]        = __float2bfloat16(dxi);
-        
-        // Use standard atomicAdd for float
+        float dyi   = __bfloat162float(dyr[i]);
+        float xi    = __bfloat162float(xr[i]);
+        float wi    = __bfloat162float(w[i]);
+        float x_hat = xi * rms;
+
+        // dx_i = rms * (w_i * dy_i  −  x_hat_i * correction)
+        //
+        // Note: w_i belongs only on the dy_i term, NOT on the correction
+        // term. x_hat_i * correction already incorporates the w weighting
+        // through the dot product computed above.
+        float dxi = rms * (wi * dyi - x_hat * correction);
+        dxr[i] = __float2bfloat16(dxi);
+
+        // Gradient for the norm weight: dw_i = Σ_rows dy_i * x_hat_i
         atomicAdd(&dw[i], dyi * x_hat);
     }
 }
@@ -180,25 +193,20 @@ void rms_norm_bwd(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  RoPE forward
+//  RoPE
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_rope(
     __nv_bfloat16* __restrict__ x,
     int T, int H, int hd, float theta, bool inverse)
 {
-    int b   = blockIdx.z;
-    int t   = blockIdx.y;
-    int h   = blockIdx.x;
+    int b   = blockIdx.z, t = blockIdx.y, h = blockIdx.x;
     int idx = (b * T * H + t * H + h) * hd;
-
     for (int i = threadIdx.x; i < hd / 2; i += blockDim.x) {
-        float freq = powf(theta, -2.f * (float)i / (float)hd);
+        float freq  = powf(theta, -2.f * (float)i / (float)hd);
         float angle = (float)t * freq;
         if (inverse) angle = -angle;
-        float cs = cosf(angle);
-        float sn = sinf(angle);
-
+        float cs = cosf(angle), sn = sinf(angle);
         float x0 = __bfloat162float(x[idx + 2*i    ]);
         float x1 = __bfloat162float(x[idx + 2*i + 1]);
         x[idx + 2*i    ] = __float2bfloat16(x0 * cs - x1 * sn);
@@ -206,18 +214,14 @@ __global__ void k_rope(
     }
 }
 
-void rope_fwd(
-    __nv_bfloat16* x,
-    int B, int T, int H, int hd, float theta, cudaStream_t s)
-{
+void rope_fwd(__nv_bfloat16* x,
+              int B, int T, int H, int hd, float theta, cudaStream_t s) {
     dim3 grid(H, T, B);
     k_rope<<<grid, min(hd/2, 256), 0, s>>>(x, T, H, hd, theta, false);
 }
 
-void rope_bwd(
-    __nv_bfloat16* dx,
-    int B, int T, int H, int hd, float theta, cudaStream_t s)
-{
+void rope_bwd(__nv_bfloat16* dx,
+              int B, int T, int H, int hd, float theta, cudaStream_t s) {
     dim3 grid(H, T, B);
     k_rope<<<grid, min(hd/2, 256), 0, s>>>(dx, T, H, hd, theta, true);
 }
@@ -227,35 +231,28 @@ void rope_bwd(
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_sdpa_fwd(
-    const __nv_bfloat16* __restrict__ Q,    
-    const __nv_bfloat16* __restrict__ K,    
-    const __nv_bfloat16* __restrict__ V,    
-    __nv_bfloat16* __restrict__       out,  
-    float* __restrict__       attn, 
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    __nv_bfloat16* __restrict__       out,
+    float* __restrict__               attn,
     int T, int Hq, int Hkv, int hd)
 {
-    int b  = blockIdx.z;
-    int hq = blockIdx.y;
-    int tq = blockIdx.x;
+    int b = blockIdx.z, hq = blockIdx.y, tq = blockIdx.x;
     int hkv = hq / (Hq / Hkv);
-
     float scale = rsqrtf((float)hd);
     const __nv_bfloat16* Qrow = Q + (b * T * Hq + tq * Hq + hq) * hd;
-    extern __shared__ float smem[]; 
+    extern __shared__ float smem[];
 
-    float row_max = -FLT_MAX;
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         const __nv_bfloat16* Krow = K + (b * T * Hkv + tk * Hkv + hkv) * hd;
         float dot = 0.f;
-        for (int i = 0; i < hd; i++) {
+        for (int i = 0; i < hd; i++)
             dot += __bfloat162float(Qrow[i]) * __bfloat162float(Krow[i]);
-        }
         smem[tk] = dot * scale;
-        row_max = fmaxf(row_max, smem[tk]);
     }
-    for (int tk = tq + 1 + threadIdx.x; tk < T; tk += blockDim.x) {
+    for (int tk = tq + 1 + threadIdx.x; tk < T; tk += blockDim.x)
         smem[tk] = -1e38f;
-    }
     __syncthreads();
 
     __shared__ float smax;
@@ -285,8 +282,8 @@ __global__ void k_sdpa_fwd(
     int attn_row = (b * Hq + hq) * T * T + tq * T;
     for (int tk = threadIdx.x; tk < T; tk += blockDim.x) {
         float aw = smem[tk] * inv_sum;
-        smem[tk] = aw;
-        attn[attn_row + tk] = aw;
+        smem[tk]          = aw;
+        attn[attn_row+tk] = aw;
     }
     __syncthreads();
 
@@ -307,9 +304,7 @@ void sdpa_fwd(
     int B, int T, int Hq, int Hkv, int hd, cudaStream_t s)
 {
     dim3 grid(T, Hq, B);
-    int  threads  = min(T, 256);
-    int  smem_bytes = T * sizeof(float);
-    k_sdpa_fwd<<<grid, threads, smem_bytes, s>>>(
+    k_sdpa_fwd<<<grid, min(T, 256), T * sizeof(float), s>>>(
         Q, K, V, out, attn_w, T, Hq, Hkv, hd);
 }
 
@@ -318,25 +313,22 @@ __global__ void k_sdpa_bwd(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
-    const float* __restrict__ attn_w,
+    const float* __restrict__         attn_w,
     __nv_bfloat16* __restrict__       dQ,
     __nv_bfloat16* __restrict__       dK,
     __nv_bfloat16* __restrict__       dV,
     int T, int Hq, int Hkv, int hd)
 {
-    int b  = blockIdx.z;
-    int hq = blockIdx.y;
-    int tq = blockIdx.x;
+    int b = blockIdx.z, hq = blockIdx.y, tq = blockIdx.x;
     int hkv = hq / (Hq / Hkv);
     float scale = rsqrtf((float)hd);
 
     const float* A = attn_w + (b * Hq + hq) * T * T + tq * T;
-    const __nv_bfloat16* dO = dout + (b * T * Hq + tq * Hq + hq) * hd;
-    const __nv_bfloat16* Qr = Q    + (b * T * Hq + tq * Hq + hq) * hd;
+    const __nv_bfloat16* dO  = dout + (b * T * Hq + tq * Hq + hq) * hd;
+    const __nv_bfloat16* Qr  = Q    + (b * T * Hq + tq * Hq + hq) * hd;
+    extern __shared__ float smem[];
 
-    extern __shared__ float smem[]; 
-
-    float dAq = 0.f; 
+    float dAq = 0.f;
     for (int i = 0; i < hd; i++) {
         float doi = __bfloat162float(dO[i]);
         float yi  = 0.f;
@@ -350,20 +342,16 @@ __global__ void k_sdpa_bwd(
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         const __nv_bfloat16* Vr = V + (b * T * Hkv + tk * Hkv + hkv) * hd;
         float dA_raw = 0.f;
-        for (int i = 0; i < hd; i++) {
+        for (int i = 0; i < hd; i++)
             dA_raw += __bfloat162float(dO[i]) * __bfloat162float(Vr[i]);
-        }
         smem[tk] = A[tk] * (dA_raw - dAq);
     }
     __syncthreads();
 
-    // dV atomic accumulation
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         __nv_bfloat16* dVr = dV + (b * T * Hkv + tk * Hkv + hkv) * hd;
-        for (int i = 0; i < hd; i++) {
-            // FIXED: use our safe BF16 atomic shim
+        for (int i = 0; i < hd; i++)
             atomic_add_bf16(dVr + i, __float2bfloat16(A[tk] * __bfloat162float(dO[i])));
-        }
     }
 
     __nv_bfloat16* dQr = dQ + (b * T * Hq + tq * Hq + hq) * hd;
@@ -376,12 +364,10 @@ __global__ void k_sdpa_bwd(
         dQr[i] = __float2bfloat16(__bfloat162float(dQr[i]) + acc * scale);
     }
 
-    // dK atomic accumulation
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         __nv_bfloat16* dKr = dK + (b * T * Hkv + tk * Hkv + hkv) * hd;
         for (int i = 0; i < hd; i++) {
             float dki = smem[tk] * __bfloat162float(Qr[i]) * scale;
-            // FIXED: use our safe BF16 atomic shim
             atomic_add_bf16(dKr + i, __float2bfloat16(dki));
         }
     }
@@ -395,9 +381,7 @@ void sdpa_bwd(
     int B, int T, int Hq, int Hkv, int hd, cudaStream_t s)
 {
     dim3 grid(T, Hq, B);
-    int threads   = min(T, 64);
-    int smem_bytes = T * sizeof(float);
-    k_sdpa_bwd<<<grid, threads, smem_bytes, s>>>(
+    k_sdpa_bwd<<<grid, min(T, 64), T * sizeof(float), s>>>(
         dout, Q, K, V, attn_w, dQ, dK, dV, T, Hq, Hkv, hd);
 }
 
@@ -406,59 +390,44 @@ void sdpa_bwd(
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_silu_mul_fwd(
-    const __nv_bfloat16* gate,
-    const __nv_bfloat16* up,
-    __nv_bfloat16* out,
-    int N)
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    __nv_bfloat16* out, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     float g = __bfloat162float(gate[i]);
     float u = __bfloat162float(up[i]);
-    float s = g / (1.f + expf(-g)); 
+    float s = g / (1.f + expf(-g));
     out[i]  = __float2bfloat16(s * u);
 }
 
 __global__ void k_silu_mul_bwd(
     const __nv_bfloat16* dout,
-    const __nv_bfloat16* gate,
-    const __nv_bfloat16* up,
-    __nv_bfloat16* dgate,
-    __nv_bfloat16* dup,
-    int N)
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    __nv_bfloat16* dgate, __nv_bfloat16* dup, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     float g  = __bfloat162float(gate[i]);
     float u  = __bfloat162float(up[i]);
     float do_ = __bfloat162float(dout[i]);
-
     float sig = 1.f / (1.f + expf(-g));
     float s   = g * sig;
-    float ds  = sig * (1.f + g * (1.f - sig)); 
-
+    float ds  = sig * (1.f + g * (1.f - sig));
     dgate[i] = __float2bfloat16(do_ * u * ds);
     dup[i]   = __float2bfloat16(do_ * s);
 }
 
-void silu_mul_fwd(
-    const __nv_bfloat16* gate, const __nv_bfloat16* up,
-    __nv_bfloat16* out, int N, cudaStream_t s)
-{
-    int threads = 256;
-    int blocks  = (N + threads - 1) / threads;
-    k_silu_mul_fwd<<<blocks, threads, 0, s>>>(gate, up, out, N);
+void silu_mul_fwd(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                  __nv_bfloat16* out, int N, cudaStream_t s) {
+    k_silu_mul_fwd<<<(N+255)/256, 256, 0, s>>>(gate, up, out, N);
 }
 
-void silu_mul_bwd(
-    const __nv_bfloat16* dout, const __nv_bfloat16* gate,
-    const __nv_bfloat16* up,
-    __nv_bfloat16* dgate, __nv_bfloat16* dup,
-    int N, cudaStream_t s)
-{
-    int threads = 256;
-    int blocks  = (N + threads - 1) / threads;
-    k_silu_mul_bwd<<<blocks, threads, 0, s>>>(dout, gate, up, dgate, dup, N);
+void silu_mul_bwd(const __nv_bfloat16* dout, const __nv_bfloat16* gate,
+                  const __nv_bfloat16* up,
+                  __nv_bfloat16* dgate, __nv_bfloat16* dup,
+                  int N, cudaStream_t s) {
+    k_silu_mul_bwd<<<(N+255)/256, 256, 0, s>>>(dout, gate, up, dgate, dup, N);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -466,24 +435,22 @@ void silu_mul_bwd(
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_cross_entropy(
-    const __nv_bfloat16* __restrict__ logits, 
-    const int* __restrict__ targets, 
-    float* __restrict__ loss_per_token, 
-    __nv_bfloat16* __restrict__ dlogits, 
+    const __nv_bfloat16* __restrict__ logits,
+    const int* __restrict__           targets,
+    float* __restrict__               loss_per_token,
+    __nv_bfloat16* __restrict__       dlogits,
     int V)
 {
     int n = blockIdx.x;
-    const __nv_bfloat16* L = logits  + n * V;
-    __nv_bfloat16* dL = dlogits + n * V;
+    const __nv_bfloat16* L  = logits  + n * V;
+    __nv_bfloat16*       dL = dlogits + n * V;
     int tgt = targets[n];
 
     float mx = -FLT_MAX;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
         mx = fmaxf(mx, __bfloat162float(L[i]));
-    }
     __shared__ float smem[32];
-    int lane = threadIdx.x % WARP;
-    int wid  = threadIdx.x / WARP;
+    int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
     mx = warp_reduce_max(mx);
     if (lane == 0) smem[wid] = mx;
     __syncthreads();
@@ -496,9 +463,8 @@ __global__ void k_cross_entropy(
     mx = smem[0];
 
     float sum = 0.f;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
         sum += expf(__bfloat162float(L[i]) - mx);
-    }
     sum = warp_reduce_sum(sum);
     if (lane == 0) smem[wid] = sum;
     __syncthreads();
@@ -506,7 +472,7 @@ __global__ void k_cross_entropy(
         sum = (threadIdx.x < blockDim.x / WARP) ? smem[threadIdx.x] : 0.f;
         sum = warp_reduce_sum(sum);
         if (threadIdx.x == 0) {
-            float log_sum = logf(sum) + mx;
+            float log_sum   = logf(sum) + mx;
             float tgt_logit = (tgt >= 0) ? __bfloat162float(L[tgt]) : 0.f;
             loss_per_token[n] = -(tgt_logit - log_sum);
             smem[0] = log_sum;
@@ -540,10 +506,9 @@ __global__ void k_embed_fwd(
     const __nv_bfloat16* table, const int* tokens,
     __nv_bfloat16* out, int D)
 {
-    int bt = blockIdx.x;
-    int tok = tokens[bt];
+    int bt = blockIdx.x, tok = tokens[bt];
     const __nv_bfloat16* row = table + tok * D;
-    __nv_bfloat16* dst = out   + bt  * D;
+    __nv_bfloat16*       dst = out   + bt  * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x)
         dst[i] = row[i];
 }
@@ -552,31 +517,54 @@ __global__ void k_embed_bwd(
     const __nv_bfloat16* dout, const int* tokens,
     float* dtable, int D)
 {
-    int bt  = blockIdx.x;
-    int tok = tokens[bt];
+    int bt = blockIdx.x, tok = tokens[bt];
     const __nv_bfloat16* src = dout   + bt  * D;
-    float* dst = dtable + tok * D;
+    float*               dst = dtable + tok * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x)
-        // Standard atomicAdd for float* - works because we renamed the bf16 one
         atomicAdd(&dst[i], __bfloat162float(src[i]));
 }
 
-void embed_fwd(
-    const __nv_bfloat16* table, const int* tokens,
-    __nv_bfloat16* out, int BT, int D, cudaStream_t s)
-{
+void embed_fwd(const __nv_bfloat16* table, const int* tokens,
+               __nv_bfloat16* out, int BT, int D, cudaStream_t s) {
     k_embed_fwd<<<BT, min(D, 512), 0, s>>>(table, tokens, out, D);
 }
 
-void embed_bwd(
-    const __nv_bfloat16* dout, const int* tokens,
-    float* dtable, int BT, int D, cudaStream_t s)
-{
+void embed_bwd(const __nv_bfloat16* dout, const int* tokens,
+               float* dtable, int BT, int D, cudaStream_t s) {
     k_embed_bwd<<<BT, min(D, 512), 0, s>>>(dout, tokens, dtable, D);
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Residual + LoRA add
+//  Bias add — out[BT, D] += bias[D]
+//
+//  Each thread block handles one row (one BT position).
+//  The bias vector is broadcast across all positions in the batch.
+//  Used for the Q, K, V attention projection biases in Qwen2.
+// ─────────────────────────────────────────────────────────────
+
+__global__ void k_add_bias(
+    __nv_bfloat16* __restrict__       out,
+    const __nv_bfloat16* __restrict__ bias,
+    int D)
+{
+    int bt = blockIdx.x;
+    __nv_bfloat16* row = out + bt * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float val = __bfloat162float(row[i]) + __bfloat162float(bias[i]);
+        row[i] = __float2bfloat16(val);
+    }
+}
+
+void add_bias(
+    __nv_bfloat16* out, const __nv_bfloat16* bias,
+    int BT, int D, cudaStream_t s)
+{
+    int threads = min(D, 512);
+    k_add_bias<<<BT, threads, 0, s>>>(out, bias, D);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Residual + LoRA adds
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_add_inplace(
@@ -584,15 +572,13 @@ __global__ void k_add_inplace(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    float a = __bfloat162float(out[i]) + __bfloat162float(delta[i]);
-    out[i] = __float2bfloat16(a);
+    out[i] = __float2bfloat16(
+        __bfloat162float(out[i]) + __bfloat162float(delta[i]));
 }
 
-void add_inplace(
-    __nv_bfloat16* out, const __nv_bfloat16* delta, int N, cudaStream_t s)
-{
-    int t = 256, b = (N + t - 1) / t;
-    k_add_inplace<<<b, t, 0, s>>>(out, delta, N);
+void add_inplace(__nv_bfloat16* out, const __nv_bfloat16* delta,
+                 int N, cudaStream_t s) {
+    k_add_inplace<<<(N+255)/256, 256, 0, s>>>(out, delta, N);
 }
 
 __global__ void k_lora_add(
@@ -600,15 +586,13 @@ __global__ void k_lora_add(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    float a = __bfloat162float(out[i]) + scale * __bfloat162float(delta[i]);
-    out[i] = __float2bfloat16(a);
+    out[i] = __float2bfloat16(
+        __bfloat162float(out[i]) + scale * __bfloat162float(delta[i]));
 }
 
-void lora_add(
-    __nv_bfloat16* out, const __nv_bfloat16* delta, float scale, int N, cudaStream_t s)
-{
-    int t = 256, b = (N + t - 1) / t;
-    k_lora_add<<<b, t, 0, s>>>(out, delta, scale, N);
+void lora_add(__nv_bfloat16* out, const __nv_bfloat16* delta,
+              float scale, int N, cudaStream_t s) {
+    k_lora_add<<<(N+255)/256, 256, 0, s>>>(out, delta, scale, N);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -637,41 +621,32 @@ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst, int N, cudaStream_t 
 
 __global__ void k_adamw(
     float* master, __nv_bfloat16* working,
-    float* m, float* v,
-    const float* grad,
+    float* m, float* v, const float* grad,
     int N,
     float lr, float b1, float b2, float eps,
     float wd, int step)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-
     float g  = grad[i];
     float mi = b1 * m[i] + (1.f - b1) * g;
     float vi = b2 * v[i] + (1.f - b2) * g * g;
-    m[i] = mi;
-    v[i] = vi;
-
-    float bc1 = 1.f - powf(b1, (float)step);
-    float bc2 = 1.f - powf(b2, (float)step);
-    float mhat = mi / bc1;
-    float vhat = vi / bc2;
-
-    float p = master[i];
-    p = p - lr * (mhat / (sqrtf(vhat) + eps) + wd * p);
+    m[i] = mi; v[i] = vi;
+    float bc1  = 1.f - powf(b1, (float)step);
+    float bc2  = 1.f - powf(b2, (float)step);
+    float mhat = mi / bc1, vhat = vi / bc2;
+    float p = master[i] - lr * (mhat / (sqrtf(vhat) + eps) + wd * master[i]);
     master[i]  = p;
     working[i] = __float2bfloat16(p);
 }
 
 void adamw_step(
     float* master, __nv_bfloat16* working,
-    float* m, float* v, const float* grad,
-    int N,
+    float* m, float* v, const float* grad, int N,
     float lr, float beta1, float beta2, float eps,
     float weight_decay, int step, cudaStream_t s)
 {
-    int threads = 256, blocks = (N + threads - 1) / threads;
-    k_adamw<<<blocks, threads, 0, s>>>(
+    k_adamw<<<(N+255)/256, 256, 0, s>>>(
         master, working, m, v, grad, N,
         lr, beta1, beta2, eps, weight_decay, step);
 }
