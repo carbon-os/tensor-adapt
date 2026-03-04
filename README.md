@@ -704,12 +704,13 @@ export HF_TOKEN="hf_your_token_here"
 ```bash
 # train — architecture detected automatically, centroid snapshots produced automatically
 ./build/tensor-adapt \
-    --base   ./models/Llama-3.1-8B/ \
-    --data   "bigcode/the-stack-v2:go" \
-    --domain "golang/gin" \
-    --tokens 50M \
-    --output ./adapters/llama-3.1-8b-golang-gin/ \
-    --device cuda:0
+    --arch    qwen2 \
+    --base    /root/.cache/tensor/models/Qwen/Qwen2.5-0.5B \
+    --data    /root/.cache/tensor/datasets/bigcode/the-stack-v2/go \
+    --domain  golang/gin \
+    --tokens  50M \
+    --output  ./adapters/qwen2.5-0.5b-golang-gin \
+    --device  cuda:0
 
 # same command, different base
 ./build/tensor-adapt \

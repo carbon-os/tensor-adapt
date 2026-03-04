@@ -33,30 +33,30 @@ using namespace tensor::resolve;
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void usage(const char* name) {
-    std::cerr 
-        "usage: " << name << " <command> [options]\n\n"
-        "commands:\n"
-        "  fetch <uri>    Download a model or dataset\n"
-        "  list  <uri>    List repo files without downloading\n"
-        "  cache          Print the cache root directory\n\n"
-        "uri formats:\n"
-        "  hf://org/repo              auto-detect type\n"
-        "  hf://org/repo:subset       dataset with inline subset\n\n"
-        "options:\n"
-        "  --model                    treat as model repo\n"
-        "  --dataset                  treat as dataset repo\n"
-        "  --subset  <name>           dataset subset filter\n"
-        "  --include <glob>           include matching files (repeatable)\n"
-        "  --exclude <glob>           exclude matching files (repeatable)\n"
-        "  --no-progress              disable progress bar\n"
-        "  --cache-dir <path>         override ~/.cache/tensor\n\n"
-        "env:\n"
-        "  HF_TOKEN                   token for gated repos\n\n"
-        "examples:\n"
-        "  hf fetch hf://meta-llama/Llama-3.1-8B --model\n"
-        "  hf fetch hf://bigcode/the-stack-v2 --dataset --subset go\n"
-        "  hf fetch hf://mistralai/Mistral-7B-v0.3 --include '*.safetensors' --include '*.json'\n"
-        "  hf list  hf://Qwen/Qwen2.5-7B\n";
+    std::cerr
+        << "usage: " << name << " <command> [options]\n\n"
+           "commands:\n"
+           "  fetch <uri>    Download a model or dataset\n"
+           "  list  <uri>    List repo files without downloading\n"
+           "  cache          Print the cache root directory\n\n"
+           "uri formats:\n"
+           "  hf://org/repo              auto-detect type\n"
+           "  hf://org/repo:subset       dataset with inline subset\n\n"
+           "options:\n"
+           "  --model                    treat as model repo\n"
+           "  --dataset                  treat as dataset repo\n"
+           "  --subset  <name>           dataset subset filter\n"
+           "  --include <glob>           include matching files (repeatable)\n"
+           "  --exclude <glob>           exclude matching files (repeatable)\n"
+           "  --no-progress              disable progress bar\n"
+           "  --cache-dir <path>         override ~/.cache/tensor\n\n"
+           "env:\n"
+           "  HF_TOKEN                   token for gated repos\n\n"
+           "examples:\n"
+           "  hf fetch hf://meta-llama/Llama-3.1-8B --model\n"
+           "  hf fetch hf://bigcode/the-stack-v2 --dataset --subset go\n"
+           "  hf fetch hf://mistralai/Mistral-7B-v0.3 --include '*.safetensors' --include '*.json'\n"
+           "  hf list  hf://Qwen/Qwen2.5-7B\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

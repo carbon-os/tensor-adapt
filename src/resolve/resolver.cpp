@@ -619,7 +619,7 @@ std::filesystem::path Resolver::resolve_hf(
     if (token && !token->empty())
         auth_header = "Authorization: Bearer " + *token;
 
-    std::size_t idx  = 0;
+    std::size_t idx   = 0;
     std::size_t total = files.size();
 
     for (const auto& file : files) {
@@ -640,8 +640,10 @@ std::filesystem::path Resolver::resolve_hf(
         if (options.show_progress) std::cout << "\n";
         else                       std::cout << "  " << std::flush;
 
+        // ── Fix: seed concatenation with std::string so the ternary
+        //   (const char* vs const char*) doesn't produce a raw pointer add.
         std::string hf_url =
-            "https://huggingface.co/" +
+            std::string("https://huggingface.co/") +
             (detected == RepoType::Dataset ? "datasets/" : "") +
             repo_id + "/resolve/main/" + file;
 
