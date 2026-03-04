@@ -223,14 +223,9 @@ struct AdaptTrainer::Impl {
     std::size_t tokens_seen = 0;
     std::size_t total_steps = 0;
 
-    // ── Timing state ──────────────────────────────────────────
-    // step_start is set at the top of do_step() and used to compute
-    // wall-clock ms/step and tokens/sec at log time.  We also track
-    // a rolling average over the last N steps so early-step JIT
-    // compilation noise doesn't dominate the reported throughput.
     Clock::time_point   step_start;
-    double              ema_ms_per_step = 0.0;   // exponential moving average
-    static constexpr double EMA_ALPHA   = 0.1;   // weight given to newest sample
+    double              ema_ms_per_step = 0.0;
+    static constexpr double EMA_ALPHA   = 0.1;
 
     Impl(const FrozenBase* b, const AdapterConfig& c,
          data::Dataset* ds, const AdaptOptions& o, const Device* d)
@@ -250,10 +245,6 @@ struct AdaptTrainer::Impl {
     }
 
     StepMetrics do_step() {
-        // ── Start wall-clock timer ─────────────────────────────
-        // We record the timestamp before any GPU work so the reported
-        // time includes H2D transfers and kernel launch overhead, giving
-        // a true end-to-end per-step figure.
         step_start = Clock::now();
 
         const BaseConfig& bc = base->config;
@@ -272,8 +263,8 @@ struct AdaptTrainer::Impl {
         // ── 2. Zero gradients ──────────────────────────────────
         model.zero_grad(*dev);
 
-        // ── 3. Forward ────────────────────────────────────────
-        auto fwd = Qwen2Base::forward(*base, tok_dev, B, T, *dev);
+        // ── 3. Forward — pass adapter so LoRA deltas are injected ──
+        auto fwd = Qwen2Base::forward(*base, tok_dev, B, T, *dev, &model);
 
         // ── 4. Step-1 diagnostics ─────────────────────────────
         if (step_count == 0) {
@@ -351,18 +342,10 @@ struct AdaptTrainer::Impl {
         tokens_seen += BT;
 
         // ── 9. Wall-clock timing ───────────────────────────────
-        // We measure after the optimizer launch but before the checkpoint
-        // sync so checkpointing steps don't inflate the running average.
-        // The GPU is still executing the optimizer kernels here; we call
-        // dev->sync() in the checkpoint branch anyway, so the cost is
-        // accounted for on those steps.  For non-checkpoint steps the
-        // timer captures everything except the optimizer tail — close
-        // enough for throughput monitoring.
         auto now = Clock::now();
         double ms = std::chrono::duration<double, std::milli>(
                         now - step_start).count();
 
-        // Initialise EMA on step 1 (step 0 includes JIT warm-up noise).
         if (step_count == 1) {
             ema_ms_per_step = ms;
         } else {

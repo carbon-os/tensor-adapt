@@ -1,5 +1,6 @@
 // qwen2.cu
 #include <tensor/base/arch/qwen2.hpp>
+#include <tensor/adapter/adapter_model.hpp>   // ← full type needed here for apply_lora_fwd
 #include <tensor/backend/cuda/device.hpp>
 #include <tensor/backend/cuda/tensor.hpp>
 #include <tensor/backend/cuda/ops.hpp>
@@ -15,7 +16,7 @@ using namespace backend::cuda;
 namespace ops = backend::cuda::ops;
 
 // ─────────────────────────────────────────────────────────────
-//  Projection helpers — see original file for cuBLAS convention notes
+//  Projection helpers
 // ─────────────────────────────────────────────────────────────
 
 static void proj_fwd(const Device& dev,
@@ -46,7 +47,8 @@ static void proj_bwd_x(const Device& dev,
 
 Qwen2ForwardResult Qwen2Base::forward(
     const FrozenBase& base, const Tensor& tokens,
-    int B, int T, const Device& dev)
+    int B, int T, const Device& dev,
+    adapter::AdapterModel* adapter)
 {
     const BaseConfig& bc = base.config;
     int BT  = B * T;
@@ -73,8 +75,8 @@ Qwen2ForwardResult Qwen2Base::forward(
 
     // ── 2. Transformer layers ──────────────────────────────────
     for (std::size_t l = 0; l < bc.num_layers; l++) {
-        const LayerWeights& lw = base.layers[l];
-        Qwen2LayerCache&    lc = res.layer_cache[l];
+        const LayerWeights&  lw = base.layers[l];
+        Qwen2LayerCache&     lc = res.layer_cache[l];
 
         // Save pre-input-norm residual for rms_norm_bwd.
         lc.pre_attn_res = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
@@ -103,11 +105,24 @@ Qwen2ForwardResult Qwen2Base::forward(
         proj_fwd(dev, lw.v_proj_w, lc.x_normed, lc.V, BT, H, kv_dim);
         ops::add_bias(lc.V.bf16(), lw.v_proj_b.bf16(), BT, kv_dim, dev.stream());
 
-        // RoPE (in-place, applied after bias).
+        // ── LoRA injection — Q, K, V ──────────────────────────
+        // Applied BEFORE RoPE so the saved lc.Q/K/V (which the backward
+        // uses as x for lora_q/k/v) are still in the pre-RoPE frame,
+        // matching the x_normed input the A matrix was applied to.
+        if (adapter) {
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_q,
+                                    lc.x_normed, lc.Q, BT, dev);
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_k,
+                                    lc.x_normed, lc.K, BT, dev);
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_v,
+                                    lc.x_normed, lc.V, BT, dev);
+        }
+
+        // RoPE (in-place, applied after bias + LoRA delta).
         ops::rope_fwd(lc.Q.bf16(), B, T, Hq,  hd, bc.rope_theta, dev.stream());
         ops::rope_fwd(lc.K.bf16(), B, T, Hkv, hd, bc.rope_theta, dev.stream());
 
-        // Attention — passes Device& so sdpa can dispatch to batched path on sm80+.
+        // Attention.
         lc.attn_out = Tensor::empty_bf16(
             {(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         lc.attn_w = Tensor::empty_f32(
@@ -120,6 +135,15 @@ Qwen2ForwardResult Qwen2Base::forward(
         // O projection (no bias).
         lc.h_mid = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         proj_fwd(dev, lw.o_proj_w, lc.attn_out, lc.h_mid, BT, Hq * hd, H);
+
+        // ── LoRA injection — O ────────────────────────────────
+        // x = attn_out (the input to o_proj), out = h_mid.
+        // Applied before adding into the residual so the delta flows
+        // through the residual stream just like the base o_proj output.
+        if (adapter) {
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_o,
+                                    lc.attn_out, lc.h_mid, BT, dev);
+        }
 
         ops::add_inplace(residual.bf16(), lc.h_mid.bf16(), BT * H, dev.stream());
 
@@ -182,7 +206,7 @@ Qwen2ForwardResult Qwen2Base::forward(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Backward
+//  Backward — unchanged
 // ─────────────────────────────────────────────────────────────
 
 std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
@@ -272,7 +296,6 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
             {(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         proj_bwd_x(dev, lw.o_proj_w, grad, dx_attn_out, BT, H, Hq * hd);
 
-        // SDPA backward — passes Device& for batched dispatch on sm80+.
         lg.dQ = Tensor::zeros(
             {(std::size_t)BT, (std::size_t)(Hq * hd)}, core::DType::BF16, dev);
         lg.dK = Tensor::zeros(

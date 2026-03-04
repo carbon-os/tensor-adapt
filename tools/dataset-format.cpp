@@ -14,6 +14,20 @@
 //     --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \
 //     --input     ~/.cache/tensor/datasets/roneneldan/TinyStories \
 //     --output    ./data/tinystories
+//
+//   # ChatML format (Qwen2 instruct / LoRA datasets):
+//   dataset-format \
+//     --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \
+//     --input     ./gomarkdown.jsonl \
+//     --output    ./data/gomarkdown \
+//     --chatml --no-eos
+//
+//   Expected JSONL schema for --chatml:
+//     {"messages": [{"role": "user",      "content": "..."},
+//                   {"role": "assistant", "content": "..."}]}
+//
+//   An optional first message with role="system" is used verbatim;
+//   if absent, the --system prompt is injected automatically.
 
 #include <tensor/tokenizer/bpe_tokenizer.hpp>
 
@@ -39,9 +53,11 @@ struct Args {
     std::string tokenizer;
     std::string input;
     std::string output;
-    std::string field  = "text";   // JSON field containing text
-    std::string format = "auto";   // auto | txt | jsonl | json
-    bool        add_eos = true;    // append EOS between documents
+    std::string field         = "text";   // JSON field containing text (non-chatml)
+    std::string format        = "auto";   // auto | txt | jsonl | json
+    std::string system_prompt = "You are a helpful assistant.";
+    bool        add_eos       = true;     // append EOS between documents
+    bool        chatml        = false;    // render messages[] → ChatML text
 };
 
 static void usage(const char* prog) {
@@ -53,24 +69,48 @@ static void usage(const char* prog) {
         << "  --input     <path>  file or directory to tokenize\n"
         << "  --output    <dir>   output directory (writes train.bin)\n\n"
         << "Optional:\n"
-        << "  --field  <name>  JSON key containing text  (default: text)\n"
-        << "  --format <fmt>   txt | jsonl | json | auto (default: auto)\n"
-        << "  --no-eos         skip EOS token between documents\n\n"
+        << "  --field  <name>     JSON key containing text        (default: text)\n"
+        << "  --format <fmt>      txt | jsonl | json | auto       (default: auto)\n"
+        << "  --no-eos            skip EOS token between documents\n\n"
+        << "ChatML options:\n"
+        << "  --chatml            parse messages[] array and render as ChatML.\n"
+        << "                      Input must be .jsonl or .json with schema:\n"
+        << "                        {\"messages\": [{\"role\": \"...\", \"content\": \"...\"}]}\n"
+        << "                      An optional first message with role=\"system\" is\n"
+        << "                      used verbatim; otherwise --system is injected.\n"
+        << "                      Pair with --no-eos: conversations already end\n"
+        << "                      with <|im_end|> (Qwen2 EOS token).\n"
+        << "  --system <prompt>   default system prompt for --chatml\n"
+        << "                      (default: \"You are a helpful assistant.\")\n\n"
         << "Input format notes:\n"
         << "  txt   — whole file is one document unless it contains\n"
         << "          <|endoftext|> separators (e.g. TinyStories)\n"
         << "  jsonl — one JSON object per line\n"
         << "  json  — JSON array of objects\n\n"
-        << "Example (TinyStories):\n"
+        << "Examples:\n"
+        << "  # TinyStories (plain text)\n"
         << "  " << prog << " \\\n"
         << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
         << "    --input     ~/.cache/tensor/datasets/roneneldan/TinyStories \\\n"
         << "    --output    ./data/tinystories\n\n"
-        << "Example (openwebtext-10k, jsonl):\n"
+        << "  # openwebtext-10k (jsonl, text field)\n"
         << "  " << prog << " \\\n"
         << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
         << "    --input     ~/.cache/tensor/datasets/stas/openwebtext-10k \\\n"
-        << "    --output    ./data/openwebtext-10k\n";
+        << "    --output    ./data/openwebtext-10k\n\n"
+        << "  # LoRA instruct dataset (ChatML)\n"
+        << "  " << prog << " \\\n"
+        << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
+        << "    --input     ./gomarkdown.jsonl \\\n"
+        << "    --output    ./data/gomarkdown \\\n"
+        << "    --chatml --no-eos\n\n"
+        << "  # ChatML with custom system prompt\n"
+        << "  " << prog << " \\\n"
+        << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
+        << "    --input     ./gomarkdown.jsonl \\\n"
+        << "    --output    ./data/gomarkdown \\\n"
+        << "    --chatml --no-eos \\\n"
+        << "    --system \"You are an expert Go developer.\"\n";
 }
 
 static Args parse(int argc, char** argv) {
@@ -81,12 +121,14 @@ static Args parse(int argc, char** argv) {
         {"--output",    &a.output},
         {"--field",     &a.field},
         {"--format",    &a.format},
+        {"--system",    &a.system_prompt},
     };
 
     for (int i = 1; i < argc; i++) {
         std::string key = argv[i];
         if (key == "-h" || key == "--help") { usage(argv[0]); std::exit(0); }
         if (key == "--no-eos")              { a.add_eos = false; continue; }
+        if (key == "--chatml")              { a.chatml  = true;  continue; }
         if (flags.count(key) && i + 1 < argc) {
             *flags[key] = argv[++i];
         } else {
@@ -143,6 +185,52 @@ private:
     std::size_t            total_ = 0;
 };
 
+// ── ChatML renderer ───────────────────────────────────────────────────────────
+//
+//  Converts a messages[] array into a single ChatML string:
+//
+//    <|im_start|>system
+//    You are a helpful assistant.<|im_end|>
+//    <|im_start|>user
+//    What is X?<|im_end|>
+//    <|im_start|>assistant
+//    X is ...<|im_end|>
+//
+//  <|im_start|> and <|im_end|> are added tokens in Qwen2's tokenizer, so
+//  BPETokenizer::encode() will emit them as single token IDs (via the
+//  special-token scan path) rather than BPE-splitting the raw bytes.
+
+static std::string render_chatml(const json& messages,
+                                  const std::string& default_system)
+{
+    std::string out;
+
+    // Check if caller provided an explicit system turn as the first message
+    bool has_system = !messages.empty() &&
+                      messages[0].value("role", "") == "system";
+
+    // Inject default system prompt if none provided
+    if (!has_system) {
+        out += "<|im_start|>system\n";
+        out += default_system;
+        out += "<|im_end|>\n";
+    }
+
+    for (const auto& msg : messages) {
+        std::string role    = msg.value("role",    "");
+        std::string content = msg.value("content", "");
+        if (role.empty() || content.empty()) continue;
+
+        out += "<|im_start|>";
+        out += role;
+        out += "\n";
+        out += content;
+        out += "<|im_end|>\n";
+    }
+
+    return out;
+}
+
 // ── Processors ────────────────────────────────────────────────────────────────
 
 static const std::string ENDOFTEXT = "<|endoftext|>";
@@ -160,6 +248,8 @@ static void flush_doc(const std::string& text,
     if (add_eos) writer.write_one(tok.eos_id());
     doc_count++;
 }
+
+// ── Plain text ────────────────────────────────────────────────────────────────
 
 static std::size_t process_txt(const fs::path& file,
                                 const BPETokenizer& tok,
@@ -189,6 +279,8 @@ static std::size_t process_txt(const fs::path& file,
     return docs;
 }
 
+// ── JSONL — flat text field ───────────────────────────────────────────────────
+
 static std::size_t process_jsonl(const fs::path& file,
                                   const BPETokenizer& tok,
                                   BinWriter& writer,
@@ -210,6 +302,33 @@ static std::size_t process_jsonl(const fs::path& file,
     }
     return docs;
 }
+
+// ── JSONL — ChatML (messages[] array) ────────────────────────────────────────
+
+static std::size_t process_jsonl_chatml(const fs::path& file,
+                                         const BPETokenizer& tok,
+                                         BinWriter& writer,
+                                         const std::string& system_prompt,
+                                         bool add_eos)
+{
+    std::ifstream f(file);
+    if (!f) throw std::runtime_error("cannot open: " + file.string());
+
+    std::size_t docs = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        try {
+            auto j = json::parse(line);
+            if (!j.contains("messages") || !j["messages"].is_array()) continue;
+            std::string text = render_chatml(j["messages"], system_prompt);
+            flush_doc(text, tok, writer, add_eos, docs);
+        } catch (...) {}
+    }
+    return docs;
+}
+
+// ── JSON array — flat text field ──────────────────────────────────────────────
 
 static std::size_t process_json(const fs::path& file,
                                  const BPETokenizer& tok,
@@ -236,14 +355,42 @@ static std::size_t process_json(const fs::path& file,
     return docs;
 }
 
-static std::size_t process_file(const fs::path& file,
-                                 const std::string& fmt_hint,
-                                 const BPETokenizer& tok,
-                                 BinWriter& writer,
-                                 const std::string& field,
-                                 bool add_eos)
+// ── JSON array — ChatML (messages[] array) ────────────────────────────────────
+
+static std::size_t process_json_chatml(const fs::path& file,
+                                        const BPETokenizer& tok,
+                                        BinWriter& writer,
+                                        const std::string& system_prompt,
+                                        bool add_eos)
 {
-    std::string fmt = fmt_hint;
+    std::ifstream f(file);
+    if (!f) throw std::runtime_error("cannot open: " + file.string());
+    json j = json::parse(f);
+
+    std::size_t docs = 0;
+
+    auto handle = [&](const json& item) {
+        if (!item.contains("messages") || !item["messages"].is_array()) return;
+        std::string text = render_chatml(item["messages"], system_prompt);
+        flush_doc(text, tok, writer, add_eos, docs);
+    };
+
+    if (j.is_array()) {
+        for (auto& item : j) handle(item);
+    } else {
+        handle(j);
+    }
+    return docs;
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+
+static std::size_t process_file(const fs::path& file,
+                                 const Args& args,
+                                 const BPETokenizer& tok,
+                                 BinWriter& writer)
+{
+    std::string fmt = args.format;
     if (fmt == "auto") {
         auto ext = file.extension().string();
         if      (ext == ".jsonl") fmt = "jsonl";
@@ -251,9 +398,18 @@ static std::size_t process_file(const fs::path& file,
         else                      fmt = "txt";
     }
 
-    if (fmt == "jsonl") return process_jsonl(file, tok, writer, field, add_eos);
-    if (fmt == "json")  return process_json (file, tok, writer, field, add_eos);
-    return                     process_txt  (file, tok, writer, add_eos);
+    if (args.chatml) {
+        if (fmt == "jsonl") return process_jsonl_chatml(file, tok, writer,
+                                                        args.system_prompt, args.add_eos);
+        if (fmt == "json")  return process_json_chatml (file, tok, writer,
+                                                        args.system_prompt, args.add_eos);
+        throw std::runtime_error(
+            "--chatml requires .jsonl or .json input, got: " + file.string());
+    }
+
+    if (fmt == "jsonl") return process_jsonl(file, tok, writer, args.field, args.add_eos);
+    if (fmt == "json")  return process_json (file, tok, writer, args.field, args.add_eos);
+    return                     process_txt  (file, tok, writer, args.add_eos);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -294,6 +450,9 @@ int main(int argc, char** argv) {
                 "no .txt / .jsonl / .json files found in: " + args.input);
 
         std::cerr << "[dataset-format] " << files.size() << " file(s) to process\n";
+        if (args.chatml)
+            std::cerr << "[dataset-format] mode: ChatML  system=\""
+                      << args.system_prompt << "\"\n";
         if (args.add_eos)
             std::cerr << "[dataset-format] appending eos=" << tok.eos_id()
                       << " between documents\n";
@@ -303,8 +462,7 @@ int main(int argc, char** argv) {
 
         for (auto& f : files) {
             std::size_t before = writer.total();
-            std::size_t docs   = process_file(f, args.format, tok, writer,
-                                              args.field, args.add_eos);
+            std::size_t docs   = process_file(f, args, tok, writer);
             std::cerr << "[dataset-format] " << f.filename().string()
                       << "  docs=" << docs
                       << "  tokens=" << (writer.total() - before) << "\n";
@@ -315,9 +473,9 @@ int main(int argc, char** argv) {
 
         std::size_t total_tokens = writer.total();
         std::cerr << "\n[dataset-format] done\n"
-                  << "  documents : " << total_docs             << "\n"
-                  << "  tokens    : " << total_tokens            << "\n"
-                  << "  output    : " << out_path.string()       << "\n"
+                  << "  documents : " << total_docs                         << "\n"
+                  << "  tokens    : " << total_tokens                        << "\n"
+                  << "  output    : " << out_path.string()                   << "\n"
                   << "  size      : " << (total_tokens * 4 / (1024 * 1024)) << " MB\n";
 
     } catch (const std::exception& e) {
