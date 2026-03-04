@@ -45,29 +45,66 @@ Every tensor adapter produces two output files:
 
 ```
 adapter.safetensors   — the A/B weight matrices (what the adapter knows)
-adapter.centroid      — the semantic centroid   (where it lives in latent space)
+adapter.centroid      — the semantic centroids  (where it lives in latent space)
 ```
 
-The `.centroid` file is a 512-dimensional vector. It is not hand-crafted. 
-It is not an embedding of the domain label. It is computed automatically 
-during training by the **Centroid Accumulator** — a component that runs 
-as a side-channel inside the training loop.
+The `.centroid` file contains a bank of 512-dimensional vectors — one per cluster.
+They are not hand-crafted. They are not embeddings of a domain label. They are 
+computed automatically during training by the **Centroid Accumulator** — a component 
+that runs as a side-channel inside the training loop — and finalized by the 
+**Centroid Merge** step after training completes.
 
-### How it is produced
+### How they are produced
 
 During the backward pass, the Centroid Accumulator monitors gradient norms 
 token by token. Hidden states that produce the highest gradient signal — the 
 tokens the model learned from most — are weighted heavily and accumulated into 
-a running centroid:
+a running centroid snapshot at every checkpoint:
 
 ```
 C = Σ ( hₜ · ‖∇Lₜ‖ )
 ```
 
-At the end of training, this centroid is normalized to the unit sphere and 
-written to `adapter.centroid`. It represents the **semantic center of mass** 
-of everything the adapter absorbed — not what you told it to learn, but what 
-the gradient signal says it actually learned.
+Each checkpoint writes its own centroid snapshot into a `centroids/` folder 
+alongside the weights. These snapshots are cheap to produce, accumulate 
+automatically, and survive training interruptions — if training dies, no 
+centroid data is lost.
+
+After training completes, the **Centroid Merge** step runs k-means across all 
+accumulated snapshots to produce the final `adapter.centroid` file. Each cluster 
+is ranked by total gradient mass — the sum of gradient signal that contributed 
+to it — so the most significant regions of learned expertise are always 
+identifiable. The merge step is independent of the weights and fully re-runnable, 
+meaning you can experiment with different cluster counts after training without 
+retraining anything.
+
+### Why multiple centroids
+
+A single mean centroid works when training data is tightly focused. But adapters 
+trained on broader slices develop expertise that isn't unimodal — the gradient 
+signal clusters around multiple distinct regions of latent space, and a single 
+mean vector ends up accurately describing none of them.
+
+Multiple centroids per adapter gives the PKM router a more accurate picture of 
+what the adapter actually learned. Adapters that span multiple sub-topics get 
+multiple index entries, each pointing back to the same adapter.
+
+### Runtime granularity
+
+The `.centroid` file always contains the full cluster bank produced at merge time. 
+How many of those clusters `tensor-inference` actually indexes is controlled at 
+deployment time:
+
+```json
+{
+  "pkm_centroids_per_adapter": 4
+}
+```
+
+At index build time, `tensor-inference` reads this value, ranks each adapter's 
+clusters by gradient mass, takes the top k, and builds the PKM from those. The 
+adapter files never change. Want more routing precision, raise the number. Want 
+a leaner index, lower it. Train once, tune routing granularity at deployment.
 
 ### Why this matters
 
@@ -80,8 +117,8 @@ model's current residual stream and retrieves the matching adapter in O(1).
 No embedding call. No keyword search. No manual routing rules.
 
 The residual stream at inference time lives in the same vector space as the 
-centroid. The query and the index are naturally aligned. The router finds the 
-right adapter because the centroid was built from the same signal the base 
+centroids. The query and the index are naturally aligned. The router finds the 
+right adapter because the centroids were built from the same signal the base 
 model uses to process tokens.
 
 A standard LoRA adapter has no centroid. It can be loaded manually or by name, 
@@ -130,9 +167,9 @@ base model.
 ```
 adapters/golang-gin/
 ├── adapter.safetensors     # A/B weight matrices for every injected layer
-├── adapter.centroid        # 512-dim semantic centroid — router index key
-├── adapter.json            # metadata — base ref, architecture, rank, alpha, 
-│                           #            layer range, domain
+├── adapter.centroid        # cluster bank — gradient-ranked centroid vectors
+├── adapter.json            # metadata — base ref, architecture, rank, alpha,
+│                           #            layer range, domain, centroid count
 └── tokenizer/              # symlink to base model tokenizer
 ```
 
@@ -251,9 +288,11 @@ tensor-adapt/
 │       ├── t5.hpp           — T5 / BART
 │       └── tensor.hpp       — Tensor Series (tensor-pretrain output)
 │
-├── centroid/       — semantic centroid accumulation and serialization
+├── centroid/       — semantic centroid accumulation, merging, and serialization
 │                     CentroidAccumulator — gradient-weighted hidden state accumulator
-│                     CentroidWriter      — normalizes and writes .centroid file
+│                     CentroidMerge       — k-means across checkpoint snapshots,
+│                                           ranks clusters by gradient mass,
+│                                           writes final adapter.centroid
 │                     hooks into trainer/ backward pass, zero overhead on forward
 │
 ├── adapter/        — adapter architecture and forward pass
@@ -267,7 +306,8 @@ tensor-adapt/
 │                     gradient clipping, BF16 + FP32 master weights
 │                     base weights excluded from all gradient ops
 │
-└── checkpoint/     — safetensors save, adapter.json + .centroid serialization
+└── checkpoint/     — safetensors save, adapter.json + centroids/ serialization
+                      centroid-merge produces final adapter.centroid from snapshots
                       output is directly loadable by tensor-inference
 ```
 
@@ -313,8 +353,11 @@ tensor::base::arch::T5Base            — T5 / BART
 tensor::base::arch::TensorBase        — Tensor Series
 
 tensor::centroid::CentroidAccumulator — hooks into backward pass, accumulates
-                                        gradient-weighted hidden states
-tensor::centroid::CentroidWriter      — finalizes, normalizes, writes .centroid
+                                        gradient-weighted hidden states,
+                                        writes snapshot to centroids/ at each checkpoint
+tensor::centroid::CentroidMerge       — runs k-means across all snapshots,
+                                        ranks clusters by gradient mass,
+                                        writes final adapter.centroid
 
 tensor::adapter::AdapterConfig        — rank, alpha, target layers derived from base
 tensor::adapter::AdapterModel         — A/B matrices, forward pass delta
@@ -327,8 +370,10 @@ tensor::trainer::CosineSchedule       — warmup → cosine decay
 tensor::trainer::GradClipper          — gradient norm clipping
 
 tensor::checkpoint::AdapterWriter     — writes adapter.safetensors + adapter.json
-                                        + adapter.centroid
+                                        + centroids/ snapshot at each checkpoint
 tensor::checkpoint::AdapterLoader     — loads and validates an adapter checkpoint
+tensor::checkpoint::CentroidMerger    — standalone merge — reads centroids/ folder,
+                                        writes adapter.centroid
 ```
 
 ---
@@ -376,7 +421,8 @@ int main() {
 
     // 5. train
     //    CentroidAccumulator runs automatically inside the training loop.
-    //    adapter.centroid is written alongside adapter.safetensors on save.
+    //    A centroid snapshot is written to centroids/ at every checkpoint.
+    //    Run centroid-merge after training to produce the final adapter.centroid.
     auto trainer = AdaptTrainer::create(base, config, dataset, options);
     trainer.run();
 }
@@ -524,17 +570,22 @@ trainer.save_adapter("./adapters/llama-3.1-8b-golang-gin/");
 ```
 llama-3.1-8b-golang-gin-step-5000/
 ├── adapter.safetensors     # A/B matrices for all injected layers
-├── adapter.centroid        # centroid snapshot at this step
 ├── optimizer.safetensors   # AdamW m, v, step tensors
 ├── train_state.json        # step, tokens_consumed, data position, RNG state
-└── adapter.json            # AdapterConfig snapshot + base model ref
+├── adapter.json            # AdapterConfig snapshot + base model ref
+└── centroids/
+    ├── step-1000.centroid  # gradient-weighted centroid snapshot at step 1000
+    ├── step-2000.centroid
+    ├── step-3000.centroid
+    ├── step-4000.centroid
+    └── step-5000.centroid
 ```
 
 **Final adapter layout** (matches the tensor-inference load format):
 ```
 llama-3.1-8b-golang-gin/
 ├── adapter.safetensors     # A/B matrices — inference-ready
-├── adapter.centroid        # semantic centroid — PKM router index key
+├── adapter.centroid        # merged cluster bank, gradient-ranked
 ├── adapter.json            # metadata contract read by tensor-inference
 └── tokenizer/              # symlink to base model tokenizer
 ```
@@ -558,13 +609,37 @@ llama-3.1-8b-golang-gin/
   "inject_down":     true,
   "tokens_trained":  48302080,
   "centroid_dim":    512,
+  "centroid_count":  16,
   "tensor_adapt_version": "0.1.0"
 }
 ```
 
-`centroid_dim` is written by the CentroidAccumulator and validated by 
-`tensor-inference` at index build time. A mismatch against the PKM codebook 
-dimension is a hard reject.
+`centroid_count` records how many clusters are stored in `adapter.centroid`.
+`tensor-inference` reads this at index build time alongside `pkm_centroids_per_adapter`
+to determine how many of those clusters to actually index. A `centroid_count` lower
+than `pkm_centroids_per_adapter` is a hard reject.
+
+---
+
+## Centroid merge
+
+After training completes, run `centroid-merge` to produce the final `adapter.centroid`
+from the checkpoint snapshots:
+
+```bash
+./build/centroid-merge \
+    ./adapters/llama-3.1-8b-golang-gin/step-5000/centroids/ \
+    --out     ./adapters/llama-3.1-8b-golang-gin/adapter.centroid \
+    --clusters 16
+```
+
+The merge step runs k-means across all snapshots, ranks each cluster by total 
+gradient mass, and writes the result. It is fully independent of the weights and 
+re-runnable at any time — you can produce a different cluster count from the same 
+snapshots without retraining.
+
+`tensor-adapt run` calls `centroid-merge` automatically at the end of a completed 
+training run. It can also be run manually against any checkpoint `centroids/` folder.
 
 ---
 
@@ -580,6 +655,7 @@ auto options = AdaptOptions {
 // seed is ignored on resume — RNG state is restored from checkpoint
 // adapter.json is validated on load — mismatched base ref fails immediately
 // centroid accumulator state is restored from the step-5000 snapshot
+// centroids/ folder carries forward — new snapshots are appended
 auto trainer = AdaptTrainer::create(base, config, dataset, options);
 trainer.run();  // continues from step 5000, same data position
 ```
@@ -588,33 +664,45 @@ trainer.run();  // continues from step 5000, same data position
 
 ## Getting datasets
 
-Same tooling as `tensor-pretrain`. `data-fetch` resolves `hf://` URIs and
-stores everything under `~/.cache/tensor/`. Fetch once, train as many
-adapters as needed.
+`hf` resolves `hf://` URIs and stores everything under `~/.cache/tensor/`.
+Fetch once, train as many adapters as needed.
+
 ```bash
-./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
-./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset python
+./build/hf fetch hf://bigcode/the-stack-v2 --dataset --subset go
+./build/hf fetch hf://bigcode/the-stack-v2 --dataset --subset python
 
 export HF_TOKEN="hf_your_token_here"
-./build/data-fetch fetch hf://some-org/some-dataset
+./build/hf fetch hf://some-org/some-dataset
 ```
 
 ---
 
 ## CLI tools
 
-### data-fetch
+### hf
 ```bash
-./build/data-fetch fetch hf://bigcode/the-stack-v2 --subset go
-./build/data-fetch fetch hf://HuggingFaceTB/smollm-corpus --subset python-edu
+# fetch a dataset subset
+./build/hf fetch hf://bigcode/the-stack-v2 --dataset --subset go
+./build/hf fetch hf://HuggingFaceTB/smollm-corpus --dataset --subset python-edu
 
+# fetch a model repo, only weights and config
+./build/hf fetch hf://meta-llama/Llama-3.1-8B --model \
+    --include '*.safetensors' --include '*.json'
+
+# fetch a gated repo
 export HF_TOKEN="hf_your_token_here"
-./build/data-fetch fetch hf://some-org/some-dataset
+./build/hf fetch hf://some-org/some-dataset
+
+# list files without downloading
+./build/hf list hf://Qwen/Qwen2.5-7B
+
+# print cache root
+./build/hf cache
 ```
 
 ### tensor-adapt
 ```bash
-# train — architecture detected automatically, centroid produced automatically
+# train — architecture detected automatically, centroid snapshots produced automatically
 ./build/tensor-adapt \
     --base   ./models/Llama-3.1-8B/ \
     --data   "bigcode/the-stack-v2:go" \
@@ -632,13 +720,28 @@ export HF_TOKEN="hf_your_token_here"
     --output ./adapters/qwen2.5-7b-golang-gin/ \
     --device cuda:0
 
-# resume — centroid accumulator state restored from checkpoint
+# resume — centroid accumulator state restored, centroids/ folder carried forward
 ./build/tensor-adapt \
     --base    ./models/Llama-3.1-8B/ \
     --domain  "golang/gin" \
     --output  ./adapters/llama-3.1-8b-golang-gin/ \
     --resume  ./adapters/llama-3.1-8b-golang-gin/step-5000/ \
     --device  cuda:0
+```
+
+### centroid-merge
+```bash
+# merge centroid snapshots from a completed training run
+./build/centroid-merge \
+    ./adapters/llama-3.1-8b-golang-gin/step-5000/centroids/ \
+    --out      ./adapters/llama-3.1-8b-golang-gin/adapter.centroid \
+    --clusters 16
+
+# re-merge with a different cluster count — no retraining required
+./build/centroid-merge \
+    ./adapters/llama-3.1-8b-golang-gin/step-5000/centroids/ \
+    --out      ./adapters/llama-3.1-8b-golang-gin/adapter.centroid \
+    --clusters 8
 ```
 
 ---
@@ -703,6 +806,6 @@ CLI tools     ██░░░░░░░░░░░░░░░░░░  in p
 
 ---
 
-**Tensor Framework** is developed by [Netangular](https://github.com/netangular).  
+**Tensor Framework** is developed by Netangular.
 *tensor-pretrain → tensor-adapt → tensor-inference*  
 Apache 2.0 — free to use, modify, and build on, including for commercial purposes.

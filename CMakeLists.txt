@@ -80,9 +80,9 @@ target_link_libraries(tensor_resolve
 
 if(TENSOR_BUILD_TOOLS)
 
-    # hf-fetch: download models and datasets from HuggingFace
-    add_executable(hf-fetch tools/hf-fetch.cpp)
-    target_link_libraries(hf-fetch PRIVATE tensor::resolve)
+    # hf: download models and datasets from HuggingFace
+    add_executable(hf tools/hf.cpp)
+    target_link_libraries(hf PRIVATE tensor::resolve)
 
 endif()
 

@@ -1,10 +1,10 @@
 /*
- * hf-fetch — general-purpose HuggingFace fetch tool for tensor-adapt
+ * hf — general-purpose HuggingFace fetch tool for tensor-adapt
  *
  * Usage:
- *   hf-fetch fetch  <uri> [options]    download a model or dataset
- *   hf-fetch list   <uri> [options]    list files without downloading
- *   hf-fetch cache                     print the cache root path
+ *   hf fetch  <uri> [options]    download a model or dataset
+ *   hf list   <uri> [options]    list files without downloading
+ *   hf cache                     print the cache root path
  *
  * URI formats:
  *   hf://org/repo                  auto-detect type
@@ -53,10 +53,10 @@ static void usage(const char* name) {
         "env:\n"
         "  HF_TOKEN                   token for gated repos\n\n"
         "examples:\n"
-        "  hf-fetch fetch hf://meta-llama/Llama-3.1-8B --model\n"
-        "  hf-fetch fetch hf://bigcode/the-stack-v2 --dataset --subset go\n"
-        "  hf-fetch fetch hf://mistralai/Mistral-7B-v0.3 --include '*.safetensors' --include '*.json'\n"
-        "  hf-fetch list  hf://Qwen/Qwen2.5-7B\n";
+        "  hf fetch hf://meta-llama/Llama-3.1-8B --model\n"
+        "  hf fetch hf://bigcode/the-stack-v2 --dataset --subset go\n"
+        "  hf fetch hf://mistralai/Mistral-7B-v0.3 --include '*.safetensors' --include '*.json'\n"
+        "  hf list  hf://Qwen/Qwen2.5-7B\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
