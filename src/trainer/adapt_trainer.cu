@@ -435,6 +435,7 @@ void AdaptTrainer::save_checkpoint(const std::string& dir) {
 
 void AdaptTrainer::save_adapter(const std::string& dir) {
     impl_->dev->sync();
+    impl_->centroid_acc.write_snapshot(impl_->step_count);
     impl_->centroid_acc.merge_and_write(16, dir + "/adapter.centroid");
     impl_->writer.save_final(
         impl_->model, *impl_->base, impl_->opts.domain,
