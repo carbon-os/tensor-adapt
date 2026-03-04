@@ -27,8 +27,13 @@ if(TENSOR_BACKEND_CUDA)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         find_package(CUDAToolkit REQUIRED)
         set(TENSOR_CUDA_FOUND TRUE)
-        # sm_70 = Volta, sm_75 = Turing (GTX 1650 etc.), sm_80+ = Ampere and newer
+        
+        # sm_70 = Volta, sm_75 = Turing, sm_80 = Ampere, sm_89 = Ada (RTX 40xx/Ada)
         set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING "CUDA archs")
+        
+        # SPEED OPTIMIZATION: Use fast math and disable debug assertions
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -Xptxas=-v -DNDEBUG")
+
         message(STATUS "tensor-adapt: CUDA backend enabled (archs=${CMAKE_CUDA_ARCHITECTURES})")
     else()
         message(STATUS "tensor-adapt: CUDA not found — CPU only")
@@ -296,9 +301,11 @@ if(TENSOR_BUILD_TOOLS)
     target_link_libraries(hf PRIVATE tensor::resolve)
 
     # dataset-format: tokenize text datasets to .bin for tensor-adapt
-    # intentionally outside the CUDA guard — no GPU needed
     add_executable(dataset-format tools/dataset-format.cpp)
-    target_link_libraries(dataset-format PRIVATE tensor::tokenizer)
+    target_link_libraries(dataset-format 
+        PRIVATE tensor::tokenizer
+        PRIVATE nlohmann_json::nlohmann_json
+    )
 
     if(TENSOR_CUDA_FOUND)
 

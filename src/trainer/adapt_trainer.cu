@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <cmath>
+#include <chrono>
 #include <iostream>
 #include <filesystem>
 
@@ -22,21 +23,29 @@ using namespace adapter;
 using namespace base;
 using namespace base::arch;
 namespace ops = backend::cuda::ops;
+using Clock = std::chrono::steady_clock;
 
 // ─────────────────────────────────────────────────────────────
-//  Gradient norm + clip
+//  Gradient norm — fully GPU-side
 // ─────────────────────────────────────────────────────────────
 
 static float compute_grad_norm(const AdapterModel& model, const Device& dev) {
-    float norm_sq = 0.f;
+    Tensor accum = Tensor::zeros_f32({1}, dev);
     for (const auto& la : model.layers) {
         for (const auto* lp : {&la.lora_q, &la.lora_k, &la.lora_v, &la.lora_o}) {
-            for (float g : lp->gA.to_host_f32()) norm_sq += g * g;
-            for (float g : lp->gB.to_host_f32()) norm_sq += g * g;
+            ops::sum_sq_into(lp->gA.f32(), accum.f32(),
+                             lp->rank * lp->in_dim,  dev.stream());
+            ops::sum_sq_into(lp->gB.f32(), accum.f32(),
+                             lp->out_dim * lp->rank, dev.stream());
         }
     }
-    return std::sqrt(norm_sq);
+    dev.sync();
+    return std::sqrt(accum.to_host_f32()[0]);
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Gradient clip
+// ─────────────────────────────────────────────────────────────
 
 __global__ static void k_grad_scale(float* g, int N, float scale) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -214,6 +223,15 @@ struct AdaptTrainer::Impl {
     std::size_t tokens_seen = 0;
     std::size_t total_steps = 0;
 
+    // ── Timing state ──────────────────────────────────────────
+    // step_start is set at the top of do_step() and used to compute
+    // wall-clock ms/step and tokens/sec at log time.  We also track
+    // a rolling average over the last N steps so early-step JIT
+    // compilation noise doesn't dominate the reported throughput.
+    Clock::time_point   step_start;
+    double              ema_ms_per_step = 0.0;   // exponential moving average
+    static constexpr double EMA_ALPHA   = 0.1;   // weight given to newest sample
+
     Impl(const FrozenBase* b, const AdapterConfig& c,
          data::Dataset* ds, const AdaptOptions& o, const Device* d)
         : base(b), cfg(c), dataset(ds), opts(o), dev(d)
@@ -232,6 +250,12 @@ struct AdaptTrainer::Impl {
     }
 
     StepMetrics do_step() {
+        // ── Start wall-clock timer ─────────────────────────────
+        // We record the timestamp before any GPU work so the reported
+        // time includes H2D transfers and kernel launch overhead, giving
+        // a true end-to-end per-step figure.
+        step_start = Clock::now();
+
         const BaseConfig& bc = base->config;
         int B  = cfg.batch_size;
         int T  = cfg.seq_len;
@@ -250,10 +274,10 @@ struct AdaptTrainer::Impl {
 
         // ── 3. Forward ────────────────────────────────────────
         auto fwd = Qwen2Base::forward(*base, tok_dev, B, T, *dev);
-        dev->sync();
 
         // ── 4. Step-1 diagnostics ─────────────────────────────
         if (step_count == 0) {
+            dev->sync();
             std::cerr << "[diag] input token IDs (first 16): ";
             for (int i = 0; i < std::min(16, BT); i++)
                 std::cerr << input_ids[i] << " ";
@@ -274,7 +298,29 @@ struct AdaptTrainer::Impl {
             loss_per_tok.f32(), fwd.dlogits.bf16(),
             BT, bc.vocab_size, dev->stream());
 
+        // ── 6. Backward ───────────────────────────────────────
+        auto layer_grads = Qwen2Base::backward(*base, fwd, B, T, *dev);
+
+        for (std::size_t l = 0; l < bc.num_layers; l++) {
+            const auto& lg = layer_grads[l];
+            LayerAdapter& la = model.layers[l];
+            const auto& lc  = fwd.layer_cache[l];
+
+            Tensor dummy_gx = Tensor::zeros(
+                {(std::size_t)BT, (std::size_t)bc.hidden_size},
+                core::DType::BF16, *dev);
+
+            model.apply_lora_bwd(la.lora_q, lc.x_normed,  lg.dQ,      dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_k, lc.x_normed,  lg.dK,      dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_v, lc.x_normed,  lg.dV,      dummy_gx, BT, *dev);
+            model.apply_lora_bwd(la.lora_o, lc.attn_out,  lg.do_proj, dummy_gx, BT, *dev);
+
+            centroid_acc.accumulate(lc.x_normed, lg.dx_attn_in, *dev);
+        }
+
+        // ── 7. Single sync — read loss + compute grad norm ────
         dev->sync();
+
         auto loss_h = loss_per_tok.to_host_f32();
         float mean_loss = 0.f;
         for (float l : loss_h) mean_loss += l;
@@ -286,51 +332,6 @@ struct AdaptTrainer::Impl {
             run_diagnostics(fwd, target_ids, bc, BT, *dev);
         }
 
-        // ── 6. Backward ───────────────────────────────────────
-        auto layer_grads = Qwen2Base::backward(*base, fwd, B, T, *dev);
-
-        for (std::size_t l = 0; l < bc.num_layers; l++) {
-            const auto& lg = layer_grads[l];
-            LayerAdapter& la = model.layers[l];
-            const auto& lc  = fwd.layer_cache[l];
-
-            // ── LoRA backward with correct upstream gradients ──
-            //
-            // apply_lora_bwd(lp, x, grad_out, grad_x, BT, dev) expects:
-            //   x        — the input that was fed into the projection in the fwd pass
-            //   grad_out — gradient w.r.t. the projection's OUTPUT
-            //
-            // Previously the code passed dx_attn_in (gradient w.r.t. the
-            // projection INPUT, i.e. x_normed) as grad_out for Q/K/V, and
-            // dx_o_in (gradient w.r.t. attn_out = o_proj INPUT) for O.
-            // Both were wrong: they sent the gradient one step too far
-            // through the projection, giving the LoRA adapters incorrect
-            // and noisy weight updates.
-            //
-            // Correct sources:
-            //   lora_q → dQ  (post sdpa_bwd + rope_bwd, pre q_proj_bwd)
-            //   lora_k → dK  (post sdpa_bwd + rope_bwd, pre k_proj_bwd)
-            //   lora_v → dV  (post sdpa_bwd, pre v_proj_bwd)
-            //   lora_o → do_proj (= grad flowing into h_mid, o_proj output)
-
-            Tensor dummy_gx = Tensor::zeros(
-                {(std::size_t)BT, (std::size_t)bc.hidden_size},
-                core::DType::BF16, *dev);
-
-            model.apply_lora_bwd(la.lora_q, lc.x_normed,  lg.dQ,      dummy_gx, BT, *dev);
-            model.apply_lora_bwd(la.lora_k, lc.x_normed,  lg.dK,      dummy_gx, BT, *dev);
-            model.apply_lora_bwd(la.lora_v, lc.x_normed,  lg.dV,      dummy_gx, BT, *dev);
-            model.apply_lora_bwd(la.lora_o, lc.attn_out,  lg.do_proj, dummy_gx, BT, *dev);
-
-            // Centroid: accumulate normed activations weighted by their
-            // gradient signal (still uses dx_attn_in, which is the correct
-            // signal for identifying which directions in x_normed-space
-            // most affect the loss).
-            centroid_acc.accumulate(lc.x_normed, lg.dx_attn_in, *dev);
-        }
-
-        // ── 7. Grad norm + clip ────────────────────────────────
-        dev->sync();
         float gnorm = compute_grad_norm(model, *dev);
 
         if (step_count == 0) {
@@ -339,19 +340,42 @@ struct AdaptTrainer::Impl {
             print_stats("layer0.lora_q.gB (post-bwd)", compute_stats_f32(gB0));
         }
 
+        // ── 8. Clip + optimizer step ───────────────────────────
         clip_gradients(model, cfg.grad_clip, gnorm, *dev);
         gnorm = std::min(gnorm, cfg.grad_clip);
 
-        // ── 8. Optimizer step ──────────────────────────────────
         float lr = schedule.lr_at(step_count);
         optimizer.step_all(model, lr, (int)step_count + 1, *dev);
-        dev->sync();
 
         step_count++;
         tokens_seen += BT;
 
-        // ── 9. Checkpoint ──────────────────────────────────────
+        // ── 9. Wall-clock timing ───────────────────────────────
+        // We measure after the optimizer launch but before the checkpoint
+        // sync so checkpointing steps don't inflate the running average.
+        // The GPU is still executing the optimizer kernels here; we call
+        // dev->sync() in the checkpoint branch anyway, so the cost is
+        // accounted for on those steps.  For non-checkpoint steps the
+        // timer captures everything except the optimizer tail — close
+        // enough for throughput monitoring.
+        auto now = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(
+                        now - step_start).count();
+
+        // Initialise EMA on step 1 (step 0 includes JIT warm-up noise).
+        if (step_count == 1) {
+            ema_ms_per_step = ms;
+        } else {
+            ema_ms_per_step = EMA_ALPHA * ms + (1.0 - EMA_ALPHA) * ema_ms_per_step;
+        }
+
+        double tokens_per_sec = (ema_ms_per_step > 0.0)
+            ? (BT * 1000.0 / ema_ms_per_step)
+            : 0.0;
+
+        // ── 10. Checkpoint ─────────────────────────────────────
         if (step_count % opts.checkpoint_every == 0) {
+            dev->sync();
             std::string ckpt = opts.output_dir + "/step-" + std::to_string(step_count);
             centroid_acc.write_snapshot(step_count);
             writer.save_checkpoint(model, *base, opts.domain,
@@ -359,7 +383,11 @@ struct AdaptTrainer::Impl {
             std::cerr << "[trainer] checkpoint → " << ckpt << "\n";
         }
 
-        return StepMetrics{step_count, tokens_seen, mean_loss, lr, gnorm};
+        return StepMetrics{
+            step_count, tokens_seen,
+            mean_loss, lr, gnorm,
+            ms, ema_ms_per_step, tokens_per_sec
+        };
     }
 };
 
@@ -383,17 +411,22 @@ void AdaptTrainer::run() {
     while (!done()) {
         auto m = step();
         if (impl_->opts.log_to_stdout && impl_->step_count % 10 == 0) {
-            std::cerr << "[step " << m.step
-                      << "] loss=" << m.loss
-                      << " lr=" << m.learning_rate
-                      << " grad=" << m.grad_norm
-                      << " tokens=" << m.tokens_consumed << "\n";
+            std::cerr << "[step " << m.step << "/" << impl_->total_steps << "]"
+                      << " loss="  << m.loss
+                      << " lr="    << m.learning_rate
+                      << " grad="  << m.grad_norm
+                      << " tok="   << m.tokens_consumed
+                      << " ms="    << static_cast<int>(m.step_ms)
+                      << " ema="   << static_cast<int>(m.ema_ms)
+                      << " tok/s=" << static_cast<int>(m.tokens_per_sec)
+                      << "\n";
         }
     }
     save_adapter(impl_->opts.output_dir);
 }
 
 void AdaptTrainer::save_checkpoint(const std::string& dir) {
+    impl_->dev->sync();
     impl_->centroid_acc.write_snapshot(impl_->step_count);
     impl_->writer.save_checkpoint(
         impl_->model, *impl_->base, impl_->opts.domain,
@@ -401,6 +434,7 @@ void AdaptTrainer::save_checkpoint(const std::string& dir) {
 }
 
 void AdaptTrainer::save_adapter(const std::string& dir) {
+    impl_->dev->sync();
     impl_->centroid_acc.merge_and_write(16, dir + "/adapter.centroid");
     impl_->writer.save_final(
         impl_->model, *impl_->base, impl_->opts.domain,

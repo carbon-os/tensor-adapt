@@ -21,6 +21,9 @@ struct StepMetrics {
     float       loss;
     float       learning_rate;
     float       grad_norm;
+    double      step_ms;        // wall-clock time for this step (ms)
+    double      ema_ms;         // exponential moving average ms/step
+    double      tokens_per_sec; // derived from ema_ms
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -28,14 +31,14 @@ struct StepMetrics {
 // ─────────────────────────────────────────────────────────────
 
 struct AdaptOptions {
-    std::string  domain;            // e.g. "golang/gin"
+    std::string  domain;           // e.g. "golang/gin"
     std::string  output_dir;
-    std::size_t  checkpoint_every  = 1000;
-    std::string  resume_from;       // "" = start fresh
-    std::string  device             = "cuda:0";
-    uint64_t     seed               = 42;
-    bool         log_to_stdout      = true;
-    std::size_t  tokens             = 50'000'000;
+    std::size_t  checkpoint_every = 1000;
+    std::string  resume_from;      // "" = start fresh
+    std::string  device            = "cuda:0";
+    uint64_t     seed              = 42;
+    bool         log_to_stdout     = true;
+    std::size_t  tokens            = 50'000'000;
 };
 
 // ─────────────────────────────────────────────────────────────

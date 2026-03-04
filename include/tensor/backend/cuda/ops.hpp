@@ -1,6 +1,7 @@
 // ops.hpp
 #pragma once
 
+#include <tensor/backend/cuda/device.hpp>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -40,6 +41,13 @@ void rope_bwd(
     cudaStream_t stream);
 
 // ── Attention ─────────────────────────────────────────────────
+//
+// On sm_80+ (Ampere / Ada): batched cuBLAS GEMMs via Tensor Cores.
+// On sm_70 / sm_75 (Volta / Turing): scalar CUDA kernel fallback.
+//
+// The Device& overload replaces the old cudaStream_t overload so the
+// batched path can access both the cuBLAS handle and the stream.
+
 void sdpa_fwd(
     const __nv_bfloat16* Q,
     const __nv_bfloat16* K,
@@ -47,7 +55,7 @@ void sdpa_fwd(
     __nv_bfloat16*       out,
     float*               attn_w,
     int B, int T, int Hq, int Hkv, int head_dim,
-    cudaStream_t stream);
+    const backend::cuda::Device& dev);
 
 void sdpa_bwd(
     const __nv_bfloat16* dout,
@@ -59,7 +67,7 @@ void sdpa_bwd(
     __nv_bfloat16*       dK,
     __nv_bfloat16*       dV,
     int B, int T, int Hq, int Hkv, int head_dim,
-    cudaStream_t stream);
+    const backend::cuda::Device& dev);
 
 // ── Gated SiLU ────────────────────────────────────────────────
 void silu_mul_fwd(
@@ -103,7 +111,6 @@ void embed_bwd(
     cudaStream_t stream);
 
 // ── Bias add ─────────────────────────────────────────────────
-// out[BT, D] += bias[D]   (broadcast row vector over batch dimension)
 void add_bias(
     __nv_bfloat16*       out,
     const __nv_bfloat16* bias,
@@ -139,5 +146,11 @@ void adamw_step(
     float lr, float beta1, float beta2, float eps,
     float weight_decay, int step,
     cudaStream_t stream);
+
+// ── Gradient norm accumulator ─────────────────────────────────
+//
+// Atomically adds sum(g[i]^2) for i in [0, N) into *accum (F32 device ptr).
+// Call once per parameter tensor, then sqrt(*accum) on the host after sync.
+void sum_sq_into(const float* g, float* accum, int N, cudaStream_t s);
 
 } // namespace tensor::backend::cuda::ops

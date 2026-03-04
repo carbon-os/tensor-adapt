@@ -15,13 +15,7 @@ using namespace backend::cuda;
 namespace ops = backend::cuda::ops;
 
 // ─────────────────────────────────────────────────────────────
-//  Row-major → cuBLAS convention (see previous comments)
-//
-//  y[BT, od] = x[BT, id] @ W[od, id]^T
-//    → transA=T(W), transB=N(x), M=od, N=BT, K=id, lda=id, ldb=id, ldc=od
-//
-//  dx[BT, id] = dy[BT, od] @ W[od, id]
-//    → transA=N(W), transB=N(dy), M=id, N=BT, K=od, lda=id, ldb=od, ldc=id
+//  Projection helpers — see original file for cuBLAS convention notes
 // ─────────────────────────────────────────────────────────────
 
 static void proj_fwd(const Device& dev,
@@ -95,11 +89,6 @@ Qwen2ForwardResult Qwen2Base::forward(
                           B, T, H, eps, dev.stream());
 
         // Q, K, V projections + bias.
-        //
-        // Qwen2 adds a learned bias to each of Q, K, V before applying RoPE.
-        // This is not optional — the pretrained weights assume bias is added,
-        // and omitting it causes the forward pass to produce completely wrong
-        // key/query/value vectors, driving loss far above ln(vocab_size).
         int kv_dim = Hkv * hd;
         lc.Q = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         lc.K = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)kv_dim}, dev);
@@ -118,7 +107,7 @@ Qwen2ForwardResult Qwen2Base::forward(
         ops::rope_fwd(lc.Q.bf16(), B, T, Hq,  hd, bc.rope_theta, dev.stream());
         ops::rope_fwd(lc.K.bf16(), B, T, Hkv, hd, bc.rope_theta, dev.stream());
 
-        // Attention.
+        // Attention — passes Device& so sdpa can dispatch to batched path on sm80+.
         lc.attn_out = Tensor::empty_bf16(
             {(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         lc.attn_w = Tensor::empty_f32(
@@ -126,7 +115,7 @@ Qwen2ForwardResult Qwen2Base::forward(
              (std::size_t)T, (std::size_t)T}, dev);
         ops::sdpa_fwd(lc.Q.bf16(), lc.K.bf16(), lc.V.bf16(),
                       lc.attn_out.bf16(), lc.attn_w.f32(),
-                      B, T, Hq, Hkv, hd, dev.stream());
+                      B, T, Hq, Hkv, hd, dev);
 
         // O projection (no bias).
         lc.h_mid = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
@@ -146,7 +135,7 @@ Qwen2ForwardResult Qwen2Base::forward(
                           lc.x_normed2.bf16(), lc.post_norm_rms.f32(),
                           B, T, H, eps, dev.stream());
 
-        // Gate + up projections (no bias), SiLU, down projection.
+        // Gate + up projections, SiLU, down projection.
         lc.gate_out = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)I}, dev);
         lc.up_out   = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)I}, dev);
         proj_fwd(dev, lw.gate_proj_w, lc.x_normed2, lc.gate_out, BT, H, I);
@@ -221,7 +210,6 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
     proj_bwd_x(dev, lm_w, fwd.dlogits, dres, BT, bc.vocab_size, H);
 
     // Backward through final RMSNorm.
-    // Must use fwd.x_final (the pre-norm residual) as x, not logits.
     Tensor dfinal_norm_w = Tensor::zeros_f32({(std::size_t)H}, dev);
     Tensor dres_norm     = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
     ops::rms_norm_bwd(
@@ -258,13 +246,10 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
         proj_bwd_x(dev, lw.gate_proj_w, dgate, dx_normed2, BT, I, H, 0.f);
         proj_bwd_x(dev, lw.up_proj_w,   dup,   dx_normed2, BT, I, H, 1.f);
 
-        // Save for centroid accumulator.
         lg.dx_ffn_in = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         cudaMemcpyAsync(lg.dx_ffn_in.data(), dx_normed2.data(),
                         dx_normed2.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
-        // Backward through post-attention layernorm.
-        // Must use lc.pre_ffn_res (pre-norm residual) as x.
         Tensor dpost_norm_w = Tensor::zeros_f32({(std::size_t)H}, dev);
         Tensor dffn_in      = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         ops::rms_norm_bwd(
@@ -279,18 +264,15 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
 
         // ── Attention backward ─────────────────────────────────
 
-        // Save gradient w.r.t. h_mid (o_proj output) before computing dx_o.
-        // This is the correct upstream signal for lora_o.
         lg.do_proj = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         cudaMemcpyAsync(lg.do_proj.data(), grad.data(), grad.nbytes(),
                         cudaMemcpyDeviceToDevice, dev.stream());
 
-        // dx_attn_out = grad @ o_proj^T  (gradient w.r.t. attn_out)
         Tensor dx_attn_out = Tensor::empty_bf16(
             {(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         proj_bwd_x(dev, lw.o_proj_w, grad, dx_attn_out, BT, H, Hq * hd);
 
-        // SDPA backward — produces dQ/dK/dV (post-softmax, pre-RoPE perspective).
+        // SDPA backward — passes Device& for batched dispatch on sm80+.
         lg.dQ = Tensor::zeros(
             {(std::size_t)BT, (std::size_t)(Hq * hd)}, core::DType::BF16, dev);
         lg.dK = Tensor::zeros(
@@ -301,30 +283,22 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
                       lc.Q.bf16(), lc.K.bf16(), lc.V.bf16(),
                       lc.attn_w.f32(),
                       lg.dQ.bf16(), lg.dK.bf16(), lg.dV.bf16(),
-                      B, T, Hq, Hkv, hd, dev.stream());
+                      B, T, Hq, Hkv, hd, dev);
 
         // RoPE backward — converts dQ/dK back to the pre-RoPE frame.
-        // After this, lg.dQ and lg.dK are the correct gradient signals
-        // for lora_q and lora_k (which operate on pre-RoPE Q/K, after
-        // the projection bias but before rope_fwd).
         ops::rope_bwd(lg.dQ.bf16(), B, T, Hq,  hd, bc.rope_theta, dev.stream());
         ops::rope_bwd(lg.dK.bf16(), B, T, Hkv, hd, bc.rope_theta, dev.stream());
 
-        // dx_normed = dQ @ q_proj + dK @ k_proj + dV @ v_proj
-        // (gradient w.r.t. x_normed, the input to all three projections)
         Tensor dx_normed = Tensor::zeros(
             {(std::size_t)BT, (std::size_t)H}, core::DType::BF16, dev);
         proj_bwd_x(dev, lw.q_proj_w, lg.dQ, dx_normed, BT, Hq * hd, H, 0.f);
         proj_bwd_x(dev, lw.k_proj_w, lg.dK, dx_normed, BT, kv_dim,   H, 1.f);
         proj_bwd_x(dev, lw.v_proj_w, lg.dV, dx_normed, BT, kv_dim,   H, 1.f);
 
-        // Save gradient w.r.t. x_normed for centroid accumulator.
         lg.dx_attn_in = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         cudaMemcpyAsync(lg.dx_attn_in.data(), dx_normed.data(),
                         dx_normed.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
-        // Backward through input layernorm.
-        // Must use lc.pre_attn_res (pre-norm residual) as x.
         Tensor din_norm_w = Tensor::zeros_f32({(std::size_t)H}, dev);
         Tensor dattn_in   = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         ops::rms_norm_bwd(

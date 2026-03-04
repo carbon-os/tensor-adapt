@@ -1,8 +1,10 @@
 // ops.cu
 #include <tensor/backend/cuda/ops.hpp>
+#include <tensor/backend/cuda/device.hpp>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <math.h>
 #include <float.h>
 
@@ -31,7 +33,7 @@ void atomic_add_bf16(__nv_bfloat16* address, __nv_bfloat16 val) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Utility
+//  Warp-level reductions
 // ─────────────────────────────────────────────────────────────
 
 static constexpr int WARP = 32;
@@ -106,21 +108,6 @@ void rms_norm_fwd(
 
 // ─────────────────────────────────────────────────────────────
 //  RMSNorm backward
-//
-//  Given y = w * x_hat  where x_hat = x * rms, rms = rsqrt(mean(x²)+ε)
-//
-//  Correct gradient w.r.t. x_i:
-//
-//    dx_i = rms * (w_i * dy_i  −  x_hat_i * dot / D)
-//
-//  where  dot = Σ_j dy_j * w_j * x_hat_j
-//
-//  Common mistake: factoring w_i outside the whole expression gives
-//    rms * w_i * (dy_i − x_hat_i * dot / D)
-//  which wrongly multiplies the correction term by w_i.
-//  This inflates gradients wherever w differs from 1 and compounds
-//  across layers, producing large gradient norms even after the
-//  rms_norm_bwd x-argument bug is fixed.
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_rms_norm_bwd(
@@ -138,7 +125,6 @@ __global__ void k_rms_norm_bwd(
     __nv_bfloat16*       dxr = dx  + row * D;
     float rms = rms_saved[row];
 
-    // Compute dot = Σ dy_j * w_j * x_hat_j  (per thread partial)
     float dot = 0.f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float dyi   = __bfloat162float(dyr[i]);
@@ -158,7 +144,6 @@ __global__ void k_rms_norm_bwd(
         if (threadIdx.x == 0) smem[0] = dot;
     }
     __syncthreads();
-    // dot/D is the scalar correction subtracted from every position.
     float correction = smem[0] / (float)D;
 
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
@@ -166,16 +151,8 @@ __global__ void k_rms_norm_bwd(
         float xi    = __bfloat162float(xr[i]);
         float wi    = __bfloat162float(w[i]);
         float x_hat = xi * rms;
-
-        // dx_i = rms * (w_i * dy_i  −  x_hat_i * correction)
-        //
-        // Note: w_i belongs only on the dy_i term, NOT on the correction
-        // term. x_hat_i * correction already incorporates the w weighting
-        // through the dot product computed above.
-        float dxi = rms * (wi * dyi - x_hat * correction);
+        float dxi   = rms * (wi * dyi - x_hat * correction);
         dxr[i] = __float2bfloat16(dxi);
-
-        // Gradient for the norm weight: dw_i = Σ_rows dy_i * x_hat_i
         atomicAdd(&dw[i], dyi * x_hat);
     }
 }
@@ -227,10 +204,10 @@ void rope_bwd(__nv_bfloat16* dx,
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Scaled dot-product attention
+//  Scalar SDPA kernels — Volta / Turing fallback (sm < 80)
 // ─────────────────────────────────────────────────────────────
 
-__global__ void k_sdpa_fwd(
+__global__ void k_sdpa_fwd_scalar(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
@@ -298,17 +275,7 @@ __global__ void k_sdpa_fwd(
     }
 }
 
-void sdpa_fwd(
-    const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
-    __nv_bfloat16* out, float* attn_w,
-    int B, int T, int Hq, int Hkv, int hd, cudaStream_t s)
-{
-    dim3 grid(T, Hq, B);
-    k_sdpa_fwd<<<grid, min(T, 256), T * sizeof(float), s>>>(
-        Q, K, V, out, attn_w, T, Hq, Hkv, hd);
-}
-
-__global__ void k_sdpa_bwd(
+__global__ void k_sdpa_bwd_scalar(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
@@ -351,7 +318,8 @@ __global__ void k_sdpa_bwd(
     for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x) {
         __nv_bfloat16* dVr = dV + (b * T * Hkv + tk * Hkv + hkv) * hd;
         for (int i = 0; i < hd; i++)
-            atomic_add_bf16(dVr + i, __float2bfloat16(A[tk] * __bfloat162float(dO[i])));
+            atomic_add_bf16(dVr + i,
+                __float2bfloat16(A[tk] * __bfloat162float(dO[i])));
     }
 
     __nv_bfloat16* dQr = dQ + (b * T * Hq + tq * Hq + hq) * hd;
@@ -373,16 +341,569 @@ __global__ void k_sdpa_bwd(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+//  Causal softmax — in-place on F32 score matrix
+//
+//  Input/output: S[B*Hq, T, T] row-major F32.
+//  Each block handles one (batch*head, tq) row of length T.
+//  Positions tk > tq are masked to -inf before softmax.
+// ─────────────────────────────────────────────────────────────
+
+__global__ void k_causal_softmax_inplace(float* S, int T) {
+    int row_idx = blockIdx.x;      // linear over (B*Hq*T) rows
+    int tq      = row_idx % T;
+    float* row  = S + row_idx * T;
+
+    for (int tk = threadIdx.x; tk < T; tk += blockDim.x)
+        if (tk > tq) row[tk] = -FLT_MAX;
+    __syncthreads();
+
+    float mx = -FLT_MAX;
+    for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x)
+        mx = fmaxf(mx, row[tk]);
+    __shared__ float smem[32];
+    int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
+    mx = warp_reduce_max(mx);
+    if (lane == 0) smem[wid] = mx;
+    __syncthreads();
+    if (wid == 0) {
+        mx = (threadIdx.x < blockDim.x / WARP) ? smem[threadIdx.x] : -FLT_MAX;
+        mx = warp_reduce_max(mx);
+        if (threadIdx.x == 0) smem[0] = mx;
+    }
+    __syncthreads();
+    mx = smem[0];
+
+    float s = 0.f;
+    for (int tk = threadIdx.x; tk < T; tk += blockDim.x) {
+        float v = (tk <= tq) ? expf(row[tk] - mx) : 0.f;
+        row[tk] = v;
+        s += v;
+    }
+    s = warp_reduce_sum(s);
+    if (lane == 0) smem[wid] = s;
+    __syncthreads();
+    if (wid == 0) {
+        s = (threadIdx.x < blockDim.x / WARP) ? smem[threadIdx.x] : 0.f;
+        s = warp_reduce_sum(s);
+        if (threadIdx.x == 0) smem[0] = s;
+    }
+    __syncthreads();
+    float inv_s = 1.f / smem[0];
+
+    for (int tk = threadIdx.x; tk < T; tk += blockDim.x)
+        row[tk] *= inv_s;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Softmax backward — in-place on dP buffer
+//
+//  dS[tq,tk] = P[tq,tk] * (dP[tq,tk] - dot)
+//  where dot = sum_j P[tq,j] * dP[tq,j]
+// ─────────────────────────────────────────────────────────────
+
+__global__ void k_softmax_bwd_inplace(
+    const float* __restrict__ P,
+    float* __restrict__       dP,
+    int T)
+{
+    int row_idx = blockIdx.x;
+    int tq      = row_idx % T;
+    const float* Prow  = P  + row_idx * T;
+    float*       dProw = dP + row_idx * T;
+
+    float dot = 0.f;
+    for (int tk = threadIdx.x; tk <= tq; tk += blockDim.x)
+        dot += Prow[tk] * dProw[tk];
+    __shared__ float smem[32];
+    int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
+    dot = warp_reduce_sum(dot);
+    if (lane == 0) smem[wid] = dot;
+    __syncthreads();
+    if (wid == 0) {
+        dot = (threadIdx.x < blockDim.x / WARP) ? smem[threadIdx.x] : 0.f;
+        dot = warp_reduce_sum(dot);
+        if (threadIdx.x == 0) smem[0] = dot;
+    }
+    __syncthreads();
+    dot = smem[0];
+
+    for (int tk = threadIdx.x; tk < T; tk += blockDim.x) {
+        float ds  = (tk <= tq) ? Prow[tk] * (dProw[tk] - dot) : 0.f;
+        dProw[tk] = ds;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Layout kernels for the batched SDPA path
+//
+//  All tensors in the rest of the codebase use these layouts:
+//    Q, K, V, dQ, dK, dV, out:  [BT, H*hd]  where BT = B*T
+//    attn_w:                     [B*Hq, T, T] (= [B, Hq, T, T] contiguous)
+//
+//  The batched GEMM path needs:
+//    Qp, Kp, Vp:   [B*Hq, T, hd]  (each query head as a separate batch)
+//
+//  pack_q    : [BT, H*hd]    → [B*H, T, hd]         (reorder dims)
+//  unpack_out: [B*H, T, hd]  → [BT, H*hd]           (reverse)
+//  expand_kv : [BT, Hkv*hd]  → [B*Hq, T, hd]        (GQA broadcast)
+//  contract_kv_f32: [B*Hq, T, hd] F32 → [BT, Hkv*hd] F32  (GQA sum)
+//
+//  Index identity used throughout:
+//    [BT, H*hd] element (bt, h, d)  →  bt*(H*hd) + h*hd + d
+//    where bt = b*T + t, so this equals b*(T*H*hd) + t*(H*hd) + h*hd + d.
+//    [B*H, T, hd] element (b*H+h, t, d) → (b*H+h)*(T*hd) + t*hd + d
+//                                         = b*(H*T*hd) + h*(T*hd) + t*hd + d.
+//    Both address the same (b,t,h,d) element — the kernels below just
+//    reorder which dimension varies fastest, which is the transpose.
+// ─────────────────────────────────────────────────────────────
+
+// [BT, H*hd]  →  [B*H, T, hd]
+__global__ void k_pack_q(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__       dst,
+    int B, int T, int H, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H * T * hd) return;
+
+    int d = idx % hd;
+    int t = (idx / hd) % T;
+    int h = (idx / (hd * T)) % H;
+    int b = idx / (hd * T * H);
+
+    // src layout: [BT, H*hd]  element (b*T+t, h, d)
+    int src_idx = (b * T + t) * (H * hd) + h * hd + d;
+    dst[idx] = src[src_idx];
+}
+
+// [B*H, T, hd]  →  [BT, H*hd]
+__global__ void k_unpack_out(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__       dst,
+    int B, int T, int H, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H * T * hd) return;
+
+    int d = idx % hd;
+    int t = (idx / hd) % T;
+    int h = (idx / (hd * T)) % H;
+    int b = idx / (hd * T * H);
+
+    // dst layout: [BT, H*hd]  element (b*T+t, h, d)
+    int dst_idx = (b * T + t) * (H * hd) + h * hd + d;
+    dst[dst_idx] = src[idx];
+}
+
+// F32 version of unpack for gradient output
+__global__ void k_unpack_out_f32_to_bf16(
+    const float* __restrict__   src,
+    __nv_bfloat16* __restrict__ dst,
+    int B, int T, int H, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * H * T * hd) return;
+
+    int d = idx % hd;
+    int t = (idx / hd) % T;
+    int h = (idx / (hd * T)) % H;
+    int b = idx / (hd * T * H);
+
+    int dst_idx = (b * T + t) * (H * hd) + h * hd + d;
+    dst[dst_idx] = __float2bfloat16(src[idx]);
+}
+
+// [BT, Hkv*hd]  →  [B*Hq, T, hd]   (GQA broadcast: each kv head fans out to ratio query heads)
+__global__ void k_expand_kv_pack(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__       dst,
+    int B, int T, int Hkv, int Hq, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * Hq * T * hd) return;
+
+    int d   = idx % hd;
+    int t   = (idx / hd) % T;
+    int hq  = (idx / (hd * T)) % Hq;
+    int b   = idx / (hd * T * Hq);
+    int hkv = hq / (Hq / Hkv);
+
+    // src layout: [BT, Hkv*hd]  element (b*T+t, hkv, d)
+    int src_idx = (b * T + t) * (Hkv * hd) + hkv * hd + d;
+    dst[idx] = src[src_idx];
+}
+
+// Accumulate [B*Hq, T, hd] F32  →  [BT, Hkv*hd] F32  (GQA reduce)
+// Caller must zero the destination before calling.
+__global__ void k_contract_kv_f32(
+    const float* __restrict__ src,   // [B*Hq, T, hd] F32
+    float* __restrict__       dst,   // [BT, Hkv*hd]  F32
+    int B, int T, int Hkv, int Hq, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * Hq * T * hd) return;
+
+    int d   = idx % hd;
+    int t   = (idx / hd) % T;
+    int hq  = (idx / (hd * T)) % Hq;
+    int b   = idx / (hd * T * Hq);
+    int hkv = hq / (Hq / Hkv);
+
+    int dst_idx = (b * T + t) * (Hkv * hd) + hkv * hd + d;
+    atomicAdd(&dst[dst_idx], src[idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Batched SDPA forward — Ampere / Ada (sm >= 80)
+//
+//  All GEMMs run in F32 to avoid mixed-precision type mismatches.
+//  BF16 inputs are cast to F32 immediately after packing; the final
+//  attention output is cast back to BF16 before unpacking.
+//
+//  GEMM argument order — row-major convention used throughout:
+//
+//    S[T,T]   = scale * Q[T,K] @ K[T,K]^T
+//      Rule: C[m,n]=A[m,k]@B[n,k]^T → M=n, N=m, K=k, opA=T, opB=N,
+//            cuBLAS A_arg = B_rm (the transposed matrix = Kp),
+//            cuBLAS B_arg = A_rm (Qp)
+//      → opA=T, opB=N, M=T, N=T, K=hd, A_arg=Kp, lda=hd, B_arg=Qp, ldb=hd
+//
+//    O[T,hd]  = P[T,T] @ V[T,hd]
+//      Rule: C[m,n]=A[m,k]@B[k,n] → M=n, N=m, K=k, opA=N, opB=N,
+//            cuBLAS A_arg = B_rm (Vp), cuBLAS B_arg = A_rm (P)
+//      → opA=N, opB=N, M=hd, N=T, K=T, A_arg=Vp, lda=hd, B_arg=P, ldb=T
+// ─────────────────────────────────────────────────────────────
+
+static void sdpa_fwd_batched(
+    const __nv_bfloat16* Q,
+    const __nv_bfloat16* K,
+    const __nv_bfloat16* V,
+    __nv_bfloat16*       out,
+    float*               attn_w,
+    int B, int T, int Hq, int Hkv, int hd,
+    const Device& dev)
+{
+    cudaStream_t s = dev.stream();
+    int BHq   = B * Hq;
+    int nQ    = B * Hq  * T * hd;   // elements in packed Q / output
+    int nKVex = B * Hq  * T * hd;   // elements in expanded K or V
+    float scale = 1.f / sqrtf((float)hd);
+
+    // ── 1. Pack Q: [BT, Hq*hd] → [B*Hq, T, hd] BF16 ─────────
+    __nv_bfloat16 *Qp_bf16, *Kp_bf16, *Vp_bf16;
+    CUDA_CHECK(cudaMalloc(&Qp_bf16, nQ    * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&Kp_bf16, nKVex * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&Vp_bf16, nKVex * sizeof(__nv_bfloat16)));
+
+    k_pack_q       <<<(nQ   +255)/256,256,0,s>>>(Q, Qp_bf16, B,T,Hq,  hd);
+    k_expand_kv_pack<<<(nKVex+255)/256,256,0,s>>>(K, Kp_bf16, B,T,Hkv,Hq,hd);
+    k_expand_kv_pack<<<(nKVex+255)/256,256,0,s>>>(V, Vp_bf16, B,T,Hkv,Hq,hd);
+
+    // ── 2. Cast packed tensors to F32 ─────────────────────────
+    // All GEMMs run in F32 — avoids mixed BF16/F32 type combinations
+    // that are not guaranteed to be supported by cublasGemmStridedBatchedEx.
+    float *Qp, *Kp, *Vp;
+    CUDA_CHECK(cudaMalloc(&Qp, nQ    * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&Kp, nKVex * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&Vp, nKVex * sizeof(float)));
+
+    cast_bf16_to_f32(Qp_bf16, Qp, nQ,    s);
+    cast_bf16_to_f32(Kp_bf16, Kp, nKVex, s);
+    cast_bf16_to_f32(Vp_bf16, Vp, nKVex, s);
+
+    cudaFree(Qp_bf16); cudaFree(Kp_bf16); cudaFree(Vp_bf16);
+
+    // ── 3. S[B*Hq, T, T] = scale * Q[T,hd] @ K[T,hd]^T ──────
+    //
+    // Convention: C_rm[m,n] = A_rm[m,k] @ B_rm[n,k]^T
+    //   → cuBLAS: M=n, N=m, K=k, opA=T, opB=N,
+    //             A_arg = B_rm = Kp  (the matrix being transposed)
+    //             B_arg = A_rm = Qp
+    //   → M=T, N=T, K=hd, A_arg=Kp, lda=hd, B_arg=Qp, ldb=hd, C=S, ldc=T
+    float* S;
+    CUDA_CHECK(cudaMalloc(&S, (size_t)BHq * T * T * sizeof(float)));
+    {
+        float beta = 0.f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            dev.cublas(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            T, T, hd,
+            &scale,
+            Kp, CUDA_R_32F, hd, (long long)(T * hd),   // A_arg = Kp
+            Qp, CUDA_R_32F, hd, (long long)(T * hd),   // B_arg = Qp
+            &beta,
+            S,  CUDA_R_32F, T,  (long long)(T * T),
+            BHq,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    // ── 4. Causal softmax in-place (S → P) ────────────────────
+    {
+        int rows    = BHq * T;
+        int threads = min(((T + WARP - 1) / WARP) * WARP, 1024);
+        k_causal_softmax_inplace<<<rows, threads, 0, s>>>(S, T);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(attn_w, S,
+        (size_t)BHq * T * T * sizeof(float),
+        cudaMemcpyDeviceToDevice, s));
+
+    // ── 5. O[B*Hq, T, hd] = P[T,T] @ V[T,hd] ─────────────────
+    //
+    // Convention: C_rm[m,n] = A_rm[m,k] @ B_rm[k,n]
+    //   → cuBLAS: M=n, N=m, K=k, opA=N, opB=N,
+    //             A_arg = B_rm = Vp,  B_arg = A_rm = P
+    //   → M=hd, N=T, K=T, A_arg=Vp, lda=hd, B_arg=P, ldb=T, C=Op, ldc=hd
+    float* Op_f32;
+    CUDA_CHECK(cudaMalloc(&Op_f32, (size_t)nQ * sizeof(float)));
+    {
+        float alpha = 1.f, beta = 0.f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            dev.cublas(),
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            hd, T, T,
+            &alpha,
+            Vp, CUDA_R_32F, hd, (long long)(T * hd),   // A_arg = Vp
+            S,  CUDA_R_32F, T,  (long long)(T * T),    // B_arg = P (S after softmax)
+            &beta,
+            Op_f32, CUDA_R_32F, hd, (long long)(T * hd),
+            BHq,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    // ── 6. Cast + unpack O: [B*Hq, T, hd] → [BT, Hq*hd] ─────
+    k_unpack_out_f32_to_bf16<<<(nQ+255)/256, 256, 0, s>>>(Op_f32, out, B, T, Hq, hd);
+
+    cudaFree(Qp); cudaFree(Kp); cudaFree(Vp);
+    cudaFree(S);  cudaFree(Op_f32);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Batched SDPA backward — Ampere / Ada (sm >= 80)
+//
+//  All GEMMs in F32 (same reasoning as forward).
+//
+//  GEMM argument order:
+//
+//    dV[T,hd]  = P^T[T,T] @ dO[T,hd]
+//      C[m,n]=A[k,m]^T@B[k,n] → M=n=hd, N=m=T, K=k=T, opA=N, opB=T,
+//        A_arg=B_rm=dO (lda=hd), B_arg=A_rm=P (ldb=T)
+//
+//    dP[T,T]   = dO[T,hd] @ V[T,hd]^T
+//      C[m,n]=A[m,k]@B[n,k]^T → M=n=T, N=m=T, K=k=hd, opA=T, opB=N,
+//        A_arg=B_rm=Vp (lda=hd), B_arg=A_rm=dO (ldb=hd)
+//
+//    dQ[T,hd]  = scale * dS[T,T] @ K[T,hd]
+//      C[m,n]=A[m,k]@B[k,n] → M=n=hd, N=m=T, K=k=T, opA=N, opB=N,
+//        A_arg=B_rm=Kp (lda=hd), B_arg=A_rm=dS (ldb=T)
+//
+//    dK[T,hd]  = scale * dS^T[T,T] @ Q[T,hd]
+//      C[m,n]=A[k,m]^T@B[k,n] → M=n=hd, N=m=T, K=k=T, opA=N, opB=T,
+//        A_arg=B_rm=Qp (lda=hd), B_arg=A_rm=dS (ldb=T)
+// ─────────────────────────────────────────────────────────────
+
+static void sdpa_bwd_batched(
+    const __nv_bfloat16* dout,
+    const __nv_bfloat16* Q,
+    const __nv_bfloat16* K,
+    const __nv_bfloat16* V,
+    const float*         attn_w,
+    __nv_bfloat16*       dQ,
+    __nv_bfloat16*       dK,
+    __nv_bfloat16*       dV,
+    int B, int T, int Hq, int Hkv, int hd,
+    const Device& dev)
+{
+    cudaStream_t s = dev.stream();
+    int BHq   = B * Hq;
+    int nQ    = B * Hq  * T * hd;
+    int nKVex = B * Hq  * T * hd;
+    int nKV   = B * Hkv * T * hd;
+
+    // ── 1. Pack inputs to [B*Hq, T, hd] BF16, then cast to F32 ──
+    __nv_bfloat16 *dOp_bf16, *Qp_bf16, *Kp_bf16, *Vp_bf16;
+    CUDA_CHECK(cudaMalloc(&dOp_bf16, nQ    * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&Qp_bf16,  nQ    * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&Kp_bf16,  nKVex * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&Vp_bf16,  nKVex * sizeof(__nv_bfloat16)));
+
+    k_pack_q        <<<(nQ   +255)/256,256,0,s>>>(dout, dOp_bf16, B,T,Hq,  hd);
+    k_pack_q        <<<(nQ   +255)/256,256,0,s>>>(Q,    Qp_bf16,  B,T,Hq,  hd);
+    k_expand_kv_pack<<<(nKVex+255)/256,256,0,s>>>(K,    Kp_bf16,  B,T,Hkv,Hq,hd);
+    k_expand_kv_pack<<<(nKVex+255)/256,256,0,s>>>(V,    Vp_bf16,  B,T,Hkv,Hq,hd);
+
+    float *dOp, *Qp, *Kp, *Vp;
+    CUDA_CHECK(cudaMalloc(&dOp, nQ    * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&Qp,  nQ    * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&Kp,  nKVex * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&Vp,  nKVex * sizeof(float)));
+
+    cast_bf16_to_f32(dOp_bf16, dOp, nQ,    s);
+    cast_bf16_to_f32(Qp_bf16,  Qp,  nQ,    s);
+    cast_bf16_to_f32(Kp_bf16,  Kp,  nKVex, s);
+    cast_bf16_to_f32(Vp_bf16,  Vp,  nKVex, s);
+
+    cudaFree(dOp_bf16); cudaFree(Qp_bf16);
+    cudaFree(Kp_bf16);  cudaFree(Vp_bf16);
+
+    const float* P = attn_w;   // [B*Hq, T, T] F32 — saved from forward
+
+    // ── 2. dV[T,hd] = P^T[T,T] @ dO[T,hd] ───────────────────
+    // C[m,n]=A[k,m]^T@B[k,n]: M=hd, N=T, K=T, opA=N, opB=T,
+    //   A_arg=dO (lda=hd), B_arg=P (ldb=T)
+    float* dVp;
+    CUDA_CHECK(cudaMalloc(&dVp, (size_t)nKVex * sizeof(float)));
+    {
+        float alpha = 1.f, beta = 0.f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            dev.cublas(),
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            hd, T, T,
+            &alpha,
+            dOp, CUDA_R_32F, hd, (long long)(T * hd),  // A_arg = dO
+            P,   CUDA_R_32F, T,  (long long)(T * T),   // B_arg = P
+            &beta,
+            dVp, CUDA_R_32F, hd, (long long)(T * hd),
+            BHq,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    // Contract dVp [B*Hq, T, hd] F32  →  dV [BT, Hkv*hd] BF16
+    {
+        float* dV_f32;
+        CUDA_CHECK(cudaMalloc(&dV_f32, (size_t)nKV * sizeof(float)));
+        CUDA_CHECK(cudaMemsetAsync(dV_f32, 0, (size_t)nKV * sizeof(float), s));
+        k_contract_kv_f32<<<(nKVex+255)/256,256,0,s>>>(dVp, dV_f32, B,T,Hkv,Hq,hd);
+        cast_f32_to_bf16(dV_f32, dV, nKV, s);
+        cudaFree(dV_f32);
+    }
+    cudaFree(dVp);
+
+    // ── 3. dP[T,T] = dO[T,hd] @ V[T,hd]^T ───────────────────
+    // C[m,n]=A[m,k]@B[n,k]^T: M=T, N=T, K=hd, opA=T, opB=N,
+    //   A_arg=Vp (lda=hd), B_arg=dO (ldb=hd)
+    float* dPbuf;
+    CUDA_CHECK(cudaMalloc(&dPbuf, (size_t)BHq * T * T * sizeof(float)));
+    {
+        float alpha = 1.f, beta = 0.f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            dev.cublas(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            T, T, hd,
+            &alpha,
+            Vp,  CUDA_R_32F, hd, (long long)(T * hd),  // A_arg = Vp  ← fixed (was dO)
+            dOp, CUDA_R_32F, hd, (long long)(T * hd),  // B_arg = dO  ← fixed (was Vp)
+            &beta,
+            dPbuf, CUDA_R_32F, T, (long long)(T * T),
+            BHq,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    // ── 4. dS = softmax_bwd(P, dP) in-place ──────────────────
+    {
+        int rows    = BHq * T;
+        int threads = min(((T + WARP - 1) / WARP) * WARP, 1024);
+        k_softmax_bwd_inplace<<<rows, threads, 0, s>>>(P, dPbuf, T);
+    }
+    // dPbuf now holds dS [B*Hq, T, T]
+
+    // ── 5. dQ[T,hd] = scale * dS[T,T] @ K[T,hd] ─────────────
+    // C[m,n]=A[m,k]@B[k,n]: M=hd, N=T, K=T, opA=N, opB=N,
+    //   A_arg=Kp (lda=hd), B_arg=dS (ldb=T)
+    float* dQp;
+    CUDA_CHECK(cudaMalloc(&dQp, (size_t)nQ * sizeof(float)));
+    {
+        float alpha = 1.f / sqrtf((float)hd), beta = 0.f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            dev.cublas(),
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            hd, T, T,
+            &alpha,
+            Kp,    CUDA_R_32F, hd, (long long)(T * hd),  // A_arg = Kp
+            dPbuf, CUDA_R_32F, T,  (long long)(T * T),   // B_arg = dS
+            &beta,
+            dQp, CUDA_R_32F, hd, (long long)(T * hd),
+            BHq,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    // Unpack dQp [B*Hq, T, hd] F32  →  dQ [BT, Hq*hd] BF16
+    k_unpack_out_f32_to_bf16<<<(nQ+255)/256, 256, 0, s>>>(dQp, dQ, B, T, Hq, hd);
+    cudaFree(dQp);
+
+    // ── 6. dK[T,hd] = scale * dS^T[T,T] @ Q[T,hd] ───────────
+    // C[m,n]=A[k,m]^T@B[k,n]: M=hd, N=T, K=T, opA=N, opB=T,
+    //   A_arg=Qp (lda=hd), B_arg=dS (ldb=T)
+    float* dKp;
+    CUDA_CHECK(cudaMalloc(&dKp, (size_t)nKVex * sizeof(float)));
+    {
+        float alpha = 1.f / sqrtf((float)hd), beta = 0.f;
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+            dev.cublas(),
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            hd, T, T,
+            &alpha,
+            Qp,    CUDA_R_32F, hd, (long long)(T * hd),  // A_arg = Qp
+            dPbuf, CUDA_R_32F, T,  (long long)(T * T),   // B_arg = dS
+            &beta,
+            dKp, CUDA_R_32F, hd, (long long)(T * hd),
+            BHq,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    // Contract dKp [B*Hq, T, hd] F32  →  dK [BT, Hkv*hd] BF16
+    {
+        float* dK_f32;
+        CUDA_CHECK(cudaMalloc(&dK_f32, (size_t)nKV * sizeof(float)));
+        CUDA_CHECK(cudaMemsetAsync(dK_f32, 0, (size_t)nKV * sizeof(float), s));
+        k_contract_kv_f32<<<(nKVex+255)/256,256,0,s>>>(dKp, dK_f32, B,T,Hkv,Hq,hd);
+        cast_f32_to_bf16(dK_f32, dK, nKV, s);
+        cudaFree(dK_f32);
+    }
+    cudaFree(dKp);
+
+    cudaFree(dOp); cudaFree(Qp); cudaFree(Kp); cudaFree(Vp);
+    cudaFree(dPbuf);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Public SDPA entry points — dispatch on sm_major
+// ─────────────────────────────────────────────────────────────
+
+void sdpa_fwd(
+    const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+    __nv_bfloat16* out, float* attn_w,
+    int B, int T, int Hq, int Hkv, int hd,
+    const Device& dev)
+{
+    if (dev.sm_major() >= 8) {
+        sdpa_fwd_batched(Q, K, V, out, attn_w, B, T, Hq, Hkv, hd, dev);
+    } else {
+        dim3 grid(T, Hq, B);
+        k_sdpa_fwd_scalar<<<grid, min(T, 256), T * sizeof(float), dev.stream()>>>(
+            Q, K, V, out, attn_w, T, Hq, Hkv, hd);
+    }
+}
+
 void sdpa_bwd(
     const __nv_bfloat16* dout,
     const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
     const float* attn_w,
     __nv_bfloat16* dQ, __nv_bfloat16* dK, __nv_bfloat16* dV,
-    int B, int T, int Hq, int Hkv, int hd, cudaStream_t s)
+    int B, int T, int Hq, int Hkv, int hd,
+    const Device& dev)
 {
-    dim3 grid(T, Hq, B);
-    k_sdpa_bwd<<<grid, min(T, 64), T * sizeof(float), s>>>(
-        dout, Q, K, V, attn_w, dQ, dK, dV, T, Hq, Hkv, hd);
+    if (dev.sm_major() >= 8) {
+        sdpa_bwd_batched(dout, Q, K, V, attn_w, dQ, dK, dV,
+                         B, T, Hq, Hkv, hd, dev);
+    } else {
+        dim3 grid(T, Hq, B);
+        k_sdpa_bwd_scalar<<<grid, min(T, 64), T * sizeof(float), dev.stream()>>>(
+            dout, Q, K, V, attn_w, dQ, dK, dV, T, Hq, Hkv, hd);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -408,8 +929,8 @@ __global__ void k_silu_mul_bwd(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    float g  = __bfloat162float(gate[i]);
-    float u  = __bfloat162float(up[i]);
+    float g   = __bfloat162float(gate[i]);
+    float u   = __bfloat162float(up[i]);
     float do_ = __bfloat162float(dout[i]);
     float sig = 1.f / (1.f + expf(-g));
     float s   = g * sig;
@@ -535,11 +1056,7 @@ void embed_bwd(const __nv_bfloat16* dout, const int* tokens,
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Bias add — out[BT, D] += bias[D]
-//
-//  Each thread block handles one row (one BT position).
-//  The bias vector is broadcast across all positions in the batch.
-//  Used for the Q, K, V attention projection biases in Qwen2.
+//  Bias add
 // ─────────────────────────────────────────────────────────────
 
 __global__ void k_add_bias(
@@ -649,6 +1166,30 @@ void adamw_step(
     k_adamw<<<(N+255)/256, 256, 0, s>>>(
         master, working, m, v, grad, N,
         lr, beta1, beta2, eps, weight_decay, step);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Gradient squared-sum accumulator
+// ─────────────────────────────────────────────────────────────
+
+__global__ void k_sum_sq_into(const float* __restrict__ g, float* accum, int N) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    float s = 0.f;
+    for (int i = tid; i < N; i += blockDim.x)
+        s += g[i] * g[i];
+    smem[tid] = s;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(accum, smem[0]);
+}
+
+void sum_sq_into(const float* g, float* accum, int N, cudaStream_t s) {
+    int t = min(((N + 31) / 32) * 32, 1024);
+    k_sum_sq_into<<<1, t, t * sizeof(float), s>>>(g, accum, N);
 }
 
 } // namespace tensor::backend::cuda::ops

@@ -252,10 +252,10 @@ With the base model and tokenized dataset in place:
 ./build/tensor-adapt \
     --arch    qwen2 \
     --base    ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \
-    --data    ./data/openwebtext-10k \
-    --domain  sample/openwebtext \
-    --tokens  50M \
-    --output  ./adapters/qwen2.5-0.5b-openwebtext \
+    --data    ./data/tinystories \
+    --domain  test/tinystories \
+    --tokens  1M \
+    --output  ./adapters/qwen2.5-0.5b-tinystories \
     --device  cuda:0
 ```
 
