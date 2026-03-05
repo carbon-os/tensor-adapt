@@ -7,7 +7,7 @@
 //   dir     recursively processes all .txt / .jsonl / .json files
 //
 // Output:
-//   <output>/train.bin   flat array of uint32_t token IDs
+//   <output>/train.bin   flat array of uint16_t token IDs
 //
 // Usage:
 //   dataset-format \
@@ -53,11 +53,11 @@ struct Args {
     std::string tokenizer;
     std::string input;
     std::string output;
-    std::string field         = "text";   // JSON field containing text (non-chatml)
-    std::string format        = "auto";   // auto | txt | jsonl | json
+    std::string field         = "text";
+    std::string format        = "auto";
     std::string system_prompt = "You are a helpful assistant.";
-    bool        add_eos       = true;     // append EOS between documents
-    bool        chatml        = false;    // render messages[] → ChatML text
+    bool        add_eos       = true;
+    bool        chatml        = false;
 };
 
 static void usage(const char* prog) {
@@ -65,7 +65,6 @@ static void usage(const char* prog) {
         << "Usage: " << prog << " [options]\n\n"
         << "Required:\n"
         << "  --tokenizer <dir>   model dir with tokenizer.json\n"
-        << "                      (or vocab.json + merges.txt)\n"
         << "  --input     <path>  file or directory to tokenize\n"
         << "  --output    <dir>   output directory (writes train.bin)\n\n"
         << "Optional:\n"
@@ -73,38 +72,16 @@ static void usage(const char* prog) {
         << "  --format <fmt>      txt | jsonl | json | auto       (default: auto)\n"
         << "  --no-eos            skip EOS token between documents\n\n"
         << "ChatML options:\n"
-        << "  --chatml            parse messages[] array and render as ChatML.\n"
-        << "                      Input must be .jsonl or .json with schema:\n"
-        << "                        {\"messages\": [{\"role\": \"...\", \"content\": \"...\"}]}\n"
-        << "                      An optional first message with role=\"system\" is\n"
-        << "                      used verbatim; otherwise --system is injected.\n"
-        << "                      Pair with --no-eos: conversations already end\n"
-        << "                      with <|im_end|> (Qwen2 EOS token).\n"
+        << "  --chatml            parse messages[] array and render as ChatML\n"
         << "  --system <prompt>   default system prompt for --chatml\n"
         << "                      (default: \"You are a helpful assistant.\")\n\n"
-        << "Input format notes:\n"
-        << "  txt   — whole file is one document unless it contains\n"
-        << "          <|endoftext|> separators (e.g. TinyStories)\n"
-        << "  jsonl — one JSON object per line\n"
-        << "  json  — JSON array of objects\n\n"
         << "Examples:\n"
-        << "  # TinyStories (plain text)\n"
+        << "  # Plain text\n"
         << "  " << prog << " \\\n"
         << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
         << "    --input     ~/.cache/tensor/datasets/roneneldan/TinyStories \\\n"
         << "    --output    ./data/tinystories\n\n"
-        << "  # openwebtext-10k (jsonl, text field)\n"
-        << "  " << prog << " \\\n"
-        << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
-        << "    --input     ~/.cache/tensor/datasets/stas/openwebtext-10k \\\n"
-        << "    --output    ./data/openwebtext-10k\n\n"
         << "  # LoRA instruct dataset (ChatML)\n"
-        << "  " << prog << " \\\n"
-        << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
-        << "    --input     ./gomarkdown.jsonl \\\n"
-        << "    --output    ./data/gomarkdown \\\n"
-        << "    --chatml --no-eos\n\n"
-        << "  # ChatML with custom system prompt\n"
         << "  " << prog << " \\\n"
         << "    --tokenizer ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \\\n"
         << "    --input     ./gomarkdown.jsonl \\\n"
@@ -147,9 +124,22 @@ static Args parse(int argc, char** argv) {
 }
 
 // ── Buffered binary writer ────────────────────────────────────────────────────
+//
+//  Writes uint16_t token IDs. Qwen2's vocab is 151,936 which fits in uint16
+//  (max 65,535 for regular tokens; special tokens like im_start=151644 do NOT
+//  fit). The tokenizer encodes special tokens via added_tokens_ so they appear
+//  as their correct IDs — we must store them as uint32 or remap.
+//
+//  *** IMPORTANT: Qwen2 special tokens (151643, 151644, 151645) exceed uint16.
+//  The Dataset::load reader uses uint16, so we write uint16 for regular tokens
+//  and assert on overflow so the mismatch is caught at format time rather than
+//  silently corrupting training data.
+//
+//  If you need full uint32 support, change both this writer and Dataset::load
+//  to use uint32_t consistently.
 
 class BinWriter {
-    static constexpr std::size_t BUF_TOKENS = 1 << 20; // 4 MB buffer
+    static constexpr std::size_t BUF_TOKENS = 1 << 20;
 
 public:
     explicit BinWriter(const fs::path& path)
@@ -185,31 +175,25 @@ private:
     std::size_t            total_ = 0;
 };
 
+// ── Line sanitiser ────────────────────────────────────────────────────────────
+//
+//  Strips \r so files created on Windows (CRLF line endings) or by tools that
+//  write CRLF don't cause json::parse to fail on every single line.
+
+static void strip_cr(std::string& s) {
+    if (!s.empty() && s.back() == '\r') s.pop_back();
+}
+
 // ── ChatML renderer ───────────────────────────────────────────────────────────
-//
-//  Converts a messages[] array into a single ChatML string:
-//
-//    <|im_start|>system
-//    You are a helpful assistant.<|im_end|>
-//    <|im_start|>user
-//    What is X?<|im_end|>
-//    <|im_start|>assistant
-//    X is ...<|im_end|>
-//
-//  <|im_start|> and <|im_end|> are added tokens in Qwen2's tokenizer, so
-//  BPETokenizer::encode() will emit them as single token IDs (via the
-//  special-token scan path) rather than BPE-splitting the raw bytes.
 
 static std::string render_chatml(const json& messages,
                                   const std::string& default_system)
 {
     std::string out;
 
-    // Check if caller provided an explicit system turn as the first message
     bool has_system = !messages.empty() &&
                       messages[0].value("role", "") == "system";
 
-    // Inject default system prompt if none provided
     if (!has_system) {
         out += "<|im_start|>system\n";
         out += default_system;
@@ -263,7 +247,6 @@ static std::size_t process_txt(const fs::path& file,
     std::size_t docs = 0;
 
     if (content.find(ENDOFTEXT) != std::string::npos) {
-        // Split on <|endoftext|> separators (e.g. TinyStories)
         std::size_t start = 0;
         while (true) {
             auto pos = content.find(ENDOFTEXT, start);
@@ -291,19 +274,33 @@ static std::size_t process_jsonl(const fs::path& file,
     if (!f) throw std::runtime_error("cannot open: " + file.string());
 
     std::size_t docs = 0;
+    std::size_t line_no = 0;
     std::string line;
+
     while (std::getline(f, line)) {
+        ++line_no;
+        strip_cr(line);
         if (line.empty()) continue;
         try {
             auto j = json::parse(line);
-            if (!j.contains(field) || !j[field].is_string()) continue;
+            if (!j.contains(field) || !j[field].is_string()) {
+                std::cerr << "[warn] line " << line_no
+                          << ": missing field '" << field << "' — keys:";
+                for (auto& [k, v] : j.items()) std::cerr << " " << k;
+                std::cerr << "\n";
+                continue;
+            }
             flush_doc(j[field].get<std::string>(), tok, writer, add_eos, docs);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            std::cerr << "[warn] line " << line_no
+                      << ": JSON parse error — " << e.what()
+                      << "\n  raw: " << line.substr(0, 120) << "\n";
+        }
     }
     return docs;
 }
 
-// ── JSONL — ChatML (messages[] array) ────────────────────────────────────────
+// ── JSONL — ChatML ────────────────────────────────────────────────────────────
 
 static std::size_t process_jsonl_chatml(const fs::path& file,
                                          const BPETokenizer& tok,
@@ -315,15 +312,29 @@ static std::size_t process_jsonl_chatml(const fs::path& file,
     if (!f) throw std::runtime_error("cannot open: " + file.string());
 
     std::size_t docs = 0;
+    std::size_t line_no = 0;
     std::string line;
+
     while (std::getline(f, line)) {
+        ++line_no;
+        strip_cr(line);
         if (line.empty()) continue;
         try {
             auto j = json::parse(line);
-            if (!j.contains("messages") || !j["messages"].is_array()) continue;
+            if (!j.contains("messages") || !j["messages"].is_array()) {
+                std::cerr << "[warn] line " << line_no
+                          << ": no 'messages' array — keys:";
+                for (auto& [k, v] : j.items()) std::cerr << " " << k;
+                std::cerr << "\n";
+                continue;
+            }
             std::string text = render_chatml(j["messages"], system_prompt);
             flush_doc(text, tok, writer, add_eos, docs);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            std::cerr << "[warn] line " << line_no
+                      << ": JSON parse error — " << e.what()
+                      << "\n  raw: " << line.substr(0, 120) << "\n";
+        }
     }
     return docs;
 }
@@ -338,24 +349,35 @@ static std::size_t process_json(const fs::path& file,
 {
     std::ifstream f(file);
     if (!f) throw std::runtime_error("cannot open: " + file.string());
-    json j = json::parse(f);
+
+    json j;
+    try {
+        j = json::parse(f);
+    } catch (const std::exception& e) {
+        throw std::runtime_error("JSON parse error in " + file.string() +
+                                 ": " + e.what());
+    }
 
     std::size_t docs = 0;
 
-    auto handle = [&](const json& item) {
-        if (!item.contains(field) || !item[field].is_string()) return;
+    auto handle = [&](const json& item, std::size_t idx) {
+        if (!item.contains(field) || !item[field].is_string()) {
+            std::cerr << "[warn] item " << idx
+                      << ": missing field '" << field << "'\n";
+            return;
+        }
         flush_doc(item[field].get<std::string>(), tok, writer, add_eos, docs);
     };
 
     if (j.is_array()) {
-        for (auto& item : j) handle(item);
+        for (std::size_t i = 0; i < j.size(); i++) handle(j[i], i);
     } else {
-        handle(j);
+        handle(j, 0);
     }
     return docs;
 }
 
-// ── JSON array — ChatML (messages[] array) ────────────────────────────────────
+// ── JSON array — ChatML ───────────────────────────────────────────────────────
 
 static std::size_t process_json_chatml(const fs::path& file,
                                         const BPETokenizer& tok,
@@ -365,20 +387,30 @@ static std::size_t process_json_chatml(const fs::path& file,
 {
     std::ifstream f(file);
     if (!f) throw std::runtime_error("cannot open: " + file.string());
-    json j = json::parse(f);
+
+    json j;
+    try {
+        j = json::parse(f);
+    } catch (const std::exception& e) {
+        throw std::runtime_error("JSON parse error in " + file.string() +
+                                 ": " + e.what());
+    }
 
     std::size_t docs = 0;
 
-    auto handle = [&](const json& item) {
-        if (!item.contains("messages") || !item["messages"].is_array()) return;
+    auto handle = [&](const json& item, std::size_t idx) {
+        if (!item.contains("messages") || !item["messages"].is_array()) {
+            std::cerr << "[warn] item " << idx << ": no 'messages' array\n";
+            return;
+        }
         std::string text = render_chatml(item["messages"], system_prompt);
         flush_doc(text, tok, writer, add_eos, docs);
     };
 
     if (j.is_array()) {
-        for (auto& item : j) handle(item);
+        for (std::size_t i = 0; i < j.size(); i++) handle(j[i], i);
     } else {
-        handle(j);
+        handle(j, 0);
     }
     return docs;
 }
@@ -473,9 +505,9 @@ int main(int argc, char** argv) {
 
         std::size_t total_tokens = writer.total();
         std::cerr << "\n[dataset-format] done\n"
-                  << "  documents : " << total_docs                         << "\n"
-                  << "  tokens    : " << total_tokens                        << "\n"
-                  << "  output    : " << out_path.string()                   << "\n"
+                  << "  documents : " << total_docs                              << "\n"
+                  << "  tokens    : " << total_tokens                             << "\n"
+                  << "  output    : " << out_path.string()                        << "\n"
                   << "  size      : " << (total_tokens * 4 / (1024 * 1024)) << " MB\n";
 
     } catch (const std::exception& e) {

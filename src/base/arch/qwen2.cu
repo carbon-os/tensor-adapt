@@ -1,6 +1,5 @@
-// qwen2.cu
 #include <tensor/base/arch/qwen2.hpp>
-#include <tensor/adapter/adapter_model.hpp>   // ← full type needed here for apply_lora_fwd
+#include <tensor/adapter/adapter_model.hpp> 
 #include <tensor/backend/cuda/device.hpp>
 #include <tensor/backend/cuda/tensor.hpp>
 #include <tensor/backend/cuda/ops.hpp>
@@ -78,19 +77,16 @@ Qwen2ForwardResult Qwen2Base::forward(
         const LayerWeights&  lw = base.layers[l];
         Qwen2LayerCache&     lc = res.layer_cache[l];
 
-        // Save pre-input-norm residual for rms_norm_bwd.
         lc.pre_attn_res = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         cudaMemcpyAsync(lc.pre_attn_res.data(), residual.data(),
                         residual.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
-        // Input layernorm.
         lc.in_norm_rms = Tensor::empty_f32({(std::size_t)BT}, dev);
         lc.x_normed    = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         ops::rms_norm_fwd(residual.bf16(), lw.input_norm_w.bf16(),
                           lc.x_normed.bf16(), lc.in_norm_rms.f32(),
                           B, T, H, eps, dev.stream());
 
-        // Q, K, V projections + bias.
         int kv_dim = Hkv * hd;
         lc.Q = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         lc.K = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)kv_dim}, dev);
@@ -105,61 +101,40 @@ Qwen2ForwardResult Qwen2Base::forward(
         proj_fwd(dev, lw.v_proj_w, lc.x_normed, lc.V, BT, H, kv_dim);
         ops::add_bias(lc.V.bf16(), lw.v_proj_b.bf16(), BT, kv_dim, dev.stream());
 
-        // ── LoRA injection — Q, K, V ──────────────────────────
-        // Applied BEFORE RoPE so the saved lc.Q/K/V (which the backward
-        // uses as x for lora_q/k/v) are still in the pre-RoPE frame,
-        // matching the x_normed input the A matrix was applied to.
         if (adapter) {
-            adapter->apply_lora_fwd(l, adapter->layers[l].lora_q,
-                                    lc.x_normed, lc.Q, BT, dev);
-            adapter->apply_lora_fwd(l, adapter->layers[l].lora_k,
-                                    lc.x_normed, lc.K, BT, dev);
-            adapter->apply_lora_fwd(l, adapter->layers[l].lora_v,
-                                    lc.x_normed, lc.V, BT, dev);
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_q, lc.x_normed, lc.Q, BT, dev);
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_k, lc.x_normed, lc.K, BT, dev);
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_v, lc.x_normed, lc.V, BT, dev);
         }
 
-        // RoPE (in-place, applied after bias + LoRA delta).
         ops::rope_fwd(lc.Q.bf16(), B, T, Hq,  hd, bc.rope_theta, dev.stream());
         ops::rope_fwd(lc.K.bf16(), B, T, Hkv, hd, bc.rope_theta, dev.stream());
 
-        // Attention.
-        lc.attn_out = Tensor::empty_bf16(
-            {(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
-        lc.attn_w = Tensor::empty_f32(
-            {(std::size_t)B, (std::size_t)Hq,
-             (std::size_t)T, (std::size_t)T}, dev);
+        lc.attn_out = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
+        lc.attn_w = Tensor::empty_f32({(std::size_t)B, (std::size_t)Hq, (std::size_t)T, (std::size_t)T}, dev);
         ops::sdpa_fwd(lc.Q.bf16(), lc.K.bf16(), lc.V.bf16(),
                       lc.attn_out.bf16(), lc.attn_w.f32(),
                       B, T, Hq, Hkv, hd, dev);
 
-        // O projection (no bias).
         lc.h_mid = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         proj_fwd(dev, lw.o_proj_w, lc.attn_out, lc.h_mid, BT, Hq * hd, H);
 
-        // ── LoRA injection — O ────────────────────────────────
-        // x = attn_out (the input to o_proj), out = h_mid.
-        // Applied before adding into the residual so the delta flows
-        // through the residual stream just like the base o_proj output.
         if (adapter) {
-            adapter->apply_lora_fwd(l, adapter->layers[l].lora_o,
-                                    lc.attn_out, lc.h_mid, BT, dev);
+            adapter->apply_lora_fwd(l, adapter->layers[l].lora_o, lc.attn_out, lc.h_mid, BT, dev);
         }
 
         ops::add_inplace(residual.bf16(), lc.h_mid.bf16(), BT * H, dev.stream());
 
-        // Save pre-post-attn-norm residual for rms_norm_bwd.
         lc.pre_ffn_res = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         cudaMemcpyAsync(lc.pre_ffn_res.data(), residual.data(),
                         residual.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
-        // Post-attention layernorm.
         lc.post_norm_rms = Tensor::empty_f32({(std::size_t)BT}, dev);
         lc.x_normed2     = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         ops::rms_norm_fwd(residual.bf16(), lw.post_norm_w.bf16(),
                           lc.x_normed2.bf16(), lc.post_norm_rms.f32(),
                           B, T, H, eps, dev.stream());
 
-        // Gate + up projections, SiLU, down projection.
         lc.gate_out = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)I}, dev);
         lc.up_out   = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)I}, dev);
         proj_fwd(dev, lw.gate_proj_w, lc.x_normed2, lc.gate_out, BT, H, I);
@@ -175,19 +150,16 @@ Qwen2ForwardResult Qwen2Base::forward(
         ops::add_inplace(residual.bf16(), lc.ffn_out.bf16(), BT * H, dev.stream());
     }
 
-    // ── 3. Save pre-final-norm residual ───────────────────────
     res.x_final = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
     cudaMemcpyAsync(res.x_final.data(), residual.data(),
                     residual.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
-    // ── 4. Final norm ──────────────────────────────────────────
     res.final_rms = Tensor::empty_f32({(std::size_t)BT}, dev);
     Tensor x_final_normed = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
     ops::rms_norm_fwd(residual.bf16(), base.final_norm_w.bf16(),
                       x_final_normed.bf16(), res.final_rms.f32(),
                       B, T, H, eps, dev.stream());
 
-    // ── 5. LM head ────────────────────────────────────────────
     const Tensor& lm_w = bc.tie_embeddings ? base.embed_w : base.lm_head_w;
     res.logits  = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)V}, dev);
     res.dlogits = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)V}, dev);
@@ -206,14 +178,15 @@ Qwen2ForwardResult Qwen2Base::forward(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Backward — unchanged
+//  Backward
 // ─────────────────────────────────────────────────────────────
 
 std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
     const FrozenBase&         base,
     const Qwen2ForwardResult& fwd,
     int B, int T,
-    const Device&             dev)
+    const Device&             dev,
+    adapter::AdapterModel* adapter)
 {
     const BaseConfig& bc = base.config;
     int BT     = B * T;
@@ -227,22 +200,15 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
 
     std::vector<LayerGrads> result(bc.num_layers);
 
-    // Backward through LM head.
     const Tensor& lm_w = bc.tie_embeddings ? base.embed_w : base.lm_head_w;
-    Tensor dres = Tensor::zeros({(std::size_t)BT, (std::size_t)H},
-                                core::DType::BF16, dev);
+    Tensor dres = Tensor::zeros({(std::size_t)BT, (std::size_t)H}, core::DType::BF16, dev);
     proj_bwd_x(dev, lm_w, fwd.dlogits, dres, BT, bc.vocab_size, H);
 
-    // Backward through final RMSNorm.
     Tensor dfinal_norm_w = Tensor::zeros_f32({(std::size_t)H}, dev);
     Tensor dres_norm     = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
     ops::rms_norm_bwd(
-        dres.bf16(),
-        fwd.x_final.bf16(),
-        base.final_norm_w.bf16(),
-        fwd.final_rms.f32(),
-        dres_norm.bf16(), dfinal_norm_w.f32(),
-        B, T, H, eps, dev.stream());
+        dres.bf16(), fwd.x_final.bf16(), base.final_norm_w.bf16(), fwd.final_rms.f32(),
+        dres_norm.bf16(), dfinal_norm_w.f32(), B, T, H, eps, dev.stream());
 
     Tensor grad = std::move(dres_norm);
 
@@ -252,10 +218,8 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
         LayerGrads&            lg = result[l];
 
         // ── FFN backward ───────────────────────────────────────
-
         Tensor dffn = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
-        cudaMemcpyAsync(dffn.data(), grad.data(), grad.nbytes(),
-                        cudaMemcpyDeviceToDevice, dev.stream());
+        cudaMemcpyAsync(dffn.data(), grad.data(), grad.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
         Tensor dact = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)I}, dev);
         proj_bwd_x(dev, lw.down_proj_w, dffn, dact, BT, H, I);
@@ -265,8 +229,7 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
         ops::silu_mul_bwd(dact.bf16(), lc.gate_out.bf16(), lc.up_out.bf16(),
                           dgate.bf16(), dup.bf16(), BT * I, dev.stream());
 
-        Tensor dx_normed2 = Tensor::zeros(
-            {(std::size_t)BT, (std::size_t)H}, core::DType::BF16, dev);
+        Tensor dx_normed2 = Tensor::zeros({(std::size_t)BT, (std::size_t)H}, core::DType::BF16, dev);
         proj_bwd_x(dev, lw.gate_proj_w, dgate, dx_normed2, BT, I, H, 0.f);
         proj_bwd_x(dev, lw.up_proj_w,   dup,   dx_normed2, BT, I, H, 1.f);
 
@@ -277,46 +240,56 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
         Tensor dpost_norm_w = Tensor::zeros_f32({(std::size_t)H}, dev);
         Tensor dffn_in      = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         ops::rms_norm_bwd(
-            dx_normed2.bf16(),
-            lc.pre_ffn_res.bf16(),
-            lw.post_norm_w.bf16(),
-            lc.post_norm_rms.f32(),
-            dffn_in.bf16(), dpost_norm_w.f32(),
-            B, T, H, eps, dev.stream());
+            dx_normed2.bf16(), lc.pre_ffn_res.bf16(), lw.post_norm_w.bf16(), lc.post_norm_rms.f32(),
+            dffn_in.bf16(), dpost_norm_w.f32(), B, T, H, eps, dev.stream());
 
         ops::add_inplace(grad.bf16(), dffn_in.bf16(), BT * H, dev.stream());
 
         // ── Attention backward ─────────────────────────────────
-
         lg.do_proj = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
-        cudaMemcpyAsync(lg.do_proj.data(), grad.data(), grad.nbytes(),
-                        cudaMemcpyDeviceToDevice, dev.stream());
+        cudaMemcpyAsync(lg.do_proj.data(), grad.data(), grad.nbytes(), cudaMemcpyDeviceToDevice, dev.stream());
 
-        Tensor dx_attn_out = Tensor::empty_bf16(
-            {(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
+        // Base O_proj backward
+        Tensor dx_attn_out = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)(Hq * hd)}, dev);
         proj_bwd_x(dev, lw.o_proj_w, grad, dx_attn_out, BT, H, Hq * hd);
 
-        lg.dQ = Tensor::zeros(
-            {(std::size_t)BT, (std::size_t)(Hq * hd)}, core::DType::BF16, dev);
-        lg.dK = Tensor::zeros(
-            {(std::size_t)BT, (std::size_t)kv_dim}, core::DType::BF16, dev);
-        lg.dV = Tensor::zeros(
-            {(std::size_t)BT, (std::size_t)kv_dim}, core::DType::BF16, dev);
+        // ── LoRA O backward ────────────────────────────────────
+        if (adapter) {
+            adapter->apply_lora_bwd(
+                adapter->layers[l].lora_o,
+                lc.attn_out, // x
+                grad,        // grad_out
+                dx_attn_out, // grad_x (accumulate here!)
+                BT, dev);
+        }
+
+        lg.dQ = Tensor::zeros({(std::size_t)BT, (std::size_t)(Hq * hd)}, core::DType::BF16, dev);
+        lg.dK = Tensor::zeros({(std::size_t)BT, (std::size_t)kv_dim}, core::DType::BF16, dev);
+        lg.dV = Tensor::zeros({(std::size_t)BT, (std::size_t)kv_dim}, core::DType::BF16, dev);
+
+        // SDPA backward
         ops::sdpa_bwd(dx_attn_out.bf16(),
                       lc.Q.bf16(), lc.K.bf16(), lc.V.bf16(),
                       lc.attn_w.f32(),
                       lg.dQ.bf16(), lg.dK.bf16(), lg.dV.bf16(),
                       B, T, Hq, Hkv, hd, dev);
 
-        // RoPE backward — converts dQ/dK back to the pre-RoPE frame.
+        // RoPE backward (dQ/dK become pre-RoPE)
         ops::rope_bwd(lg.dQ.bf16(), B, T, Hq,  hd, bc.rope_theta, dev.stream());
         ops::rope_bwd(lg.dK.bf16(), B, T, Hkv, hd, bc.rope_theta, dev.stream());
 
-        Tensor dx_normed = Tensor::zeros(
-            {(std::size_t)BT, (std::size_t)H}, core::DType::BF16, dev);
+        // Base Q/K/V projections backward
+        Tensor dx_normed = Tensor::zeros({(std::size_t)BT, (std::size_t)H}, core::DType::BF16, dev);
         proj_bwd_x(dev, lw.q_proj_w, lg.dQ, dx_normed, BT, Hq * hd, H, 0.f);
         proj_bwd_x(dev, lw.k_proj_w, lg.dK, dx_normed, BT, kv_dim,   H, 1.f);
         proj_bwd_x(dev, lw.v_proj_w, lg.dV, dx_normed, BT, kv_dim,   H, 1.f);
+
+        // ── LoRA Q/K/V backward ────────────────────────────────
+        if (adapter) {
+             adapter->apply_lora_bwd(adapter->layers[l].lora_q, lc.x_normed, lg.dQ, dx_normed, BT, dev);
+             adapter->apply_lora_bwd(adapter->layers[l].lora_k, lc.x_normed, lg.dK, dx_normed, BT, dev);
+             adapter->apply_lora_bwd(adapter->layers[l].lora_v, lc.x_normed, lg.dV, dx_normed, BT, dev);
+        }
 
         lg.dx_attn_in = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         cudaMemcpyAsync(lg.dx_attn_in.data(), dx_normed.data(),
@@ -325,12 +298,8 @@ std::vector<Qwen2Base::LayerGrads> Qwen2Base::backward(
         Tensor din_norm_w = Tensor::zeros_f32({(std::size_t)H}, dev);
         Tensor dattn_in   = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)H}, dev);
         ops::rms_norm_bwd(
-            dx_normed.bf16(),
-            lc.pre_attn_res.bf16(),
-            lw.input_norm_w.bf16(),
-            lc.in_norm_rms.f32(),
-            dattn_in.bf16(), din_norm_w.f32(),
-            B, T, H, eps, dev.stream());
+            dx_normed.bf16(), lc.pre_attn_res.bf16(), lw.input_norm_w.bf16(), lc.in_norm_rms.f32(),
+            dattn_in.bf16(), din_norm_w.f32(), B, T, H, eps, dev.stream());
 
         ops::add_inplace(grad.bf16(), dattn_in.bf16(), BT * H, dev.stream());
     }

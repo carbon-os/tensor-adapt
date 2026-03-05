@@ -1,4 +1,3 @@
-// qwen2.hpp
 #pragma once
 
 #include <tensor/base/frozen_base.hpp>
@@ -7,9 +6,7 @@
 
 #include <vector>
 
-// Forward declaration — avoids circular dependency with adapter_model.hpp
-// (adapter_model.hpp includes qwen2.hpp transitively).
-// The full type is only needed in qwen2.cu where apply_lora_fwd is called.
+// Forward declaration
 namespace tensor::adapter { class AdapterModel; }
 
 namespace tensor::base::arch {
@@ -60,21 +57,20 @@ public:
         Tensor dx_ffn_in;
     };
 
-    // adapter is optional — pass nullptr for inference / base-only forward.
-    // When non-null, LoRA deltas are injected after Q, K, V, and O projections
-    // in every layer before the results are used downstream.
     static Qwen2ForwardResult forward(
         const FrozenBase&          base,
         const Tensor&              tokens,
         int B, int T,
         const Device&              dev,
-        adapter::AdapterModel*     adapter = nullptr);
+        adapter::AdapterModel* adapter = nullptr);
 
+    // FIXED: Added adapter argument here
     static std::vector<LayerGrads> backward(
         const FrozenBase&         base,
         const Qwen2ForwardResult& fwd,
         int B, int T,
-        const Device&             dev);
+        const Device&             dev,
+        adapter::AdapterModel* adapter = nullptr); 
 };
 
 } // namespace tensor::base::arch

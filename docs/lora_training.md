@@ -86,14 +86,20 @@ dataset-format \
   --output    ./data/gomarkdown \
   --chatml --no-eos
 
-tensor-adapt \
-  --arch   qwen2 \
-  --base   ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \
-  --data   ./data/gomarkdown \
-  --domain my/gomarkdown \
-  --tokens 800000 \
-  --output ./adapters/gomarkdown \
-  --device cuda:0
+./build/tensor-adapt \
+    --arch    qwen2 \
+    --base    ~/.cache/tensor/models/Qwen/Qwen2.5-0.5B \
+    --data    ./data/gomarkdown \
+    --domain  test/gomarkdown \
+    --output  ./adapters/gomarkdown \
+    --device  cuda:0 \
+    --tokens  50M \
+    --rank    16 \
+    --alpha   16 \
+    --lr      2e-4 \
+    --warmup  200 \
+    --seq     512 \
+    --ckpt-every 500
 
 # Small dataset — ~60K tokens, ~800 Q&A pairs
 tensor-adapt \

@@ -91,22 +91,6 @@ AdapterModel AdapterModel::create(
 
 // ─────────────────────────────────────────────────────────────
 //  cuBLAS GEMM convention for row-major matrices
-//
-//  cuBLAS is column-major. A row-major matrix X[r,c] passed
-//  with lda=c appears to cuBLAS as the col-major matrix X^T[c,r].
-//
-//  To compute row-major C[m,n] = op_A(A) * op_B(B):
-//    C^T[n,m] = op_B(B)^T * op_A(A)^T
-//
-//  Practical rule per operation used here:
-//
-//    C[m,n]  = A[m,k]   @ B[k,n]     → M=n, N=m, K=k, tA=N, tB=N, args=(B,n,A,k,C,n)
-//    C[m,n]  = A[k,m]^T @ B[k,n]     → M=n, N=m, K=k, tA=N, tB=T, args=(B,n,A,m,C,n)
-//    C[m,n]  = A[m,k]   @ B[n,k]^T   → M=n, N=m, K=k, tA=T, tB=N, args=(B,k,A,k,C,n)
-//    C[m,n] += A[m,k]   @ B[k,n]     → same as above with beta=1
-//
-//  Leading dimensions are always the col-count of the row-major matrix
-//  (= the memory stride), regardless of transpose flag.
 // ─────────────────────────────────────────────────────────────
 
 void AdapterModel::apply_lora_fwd(
@@ -115,12 +99,6 @@ void AdapterModel::apply_lora_fwd(
     int BT, const Device& dev)
 {
     // h[BT, rank] = x[BT, in_dim] @ A[rank, in_dim]^T
-    //
-    // C^T[rank,BT] = A[rank,in_dim] @ x^T[in_dim,BT]
-    // cuBLAS: M=rank, N=BT, K=in_dim, tA=T(A), tB=F(x)
-    //   A_arg=A_bf16 (rm[rank,in]→cm[in,rank], transT→[rank,in]) lda=in_dim
-    //   B_arg=x      (rm[BT,in]→cm[in,BT],     transF→[in,BT])   ldb=in_dim
-    //   C_arg=h      (rm[BT,rank]→cm[rank,BT])                    ldc=rank
     Tensor h = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)lp.rank}, dev);
     {
         GemmParams p;
@@ -134,12 +112,6 @@ void AdapterModel::apply_lora_fwd(
     }
 
     // delta[BT, out_dim] = h[BT, rank] @ B[out_dim, rank]^T
-    //
-    // C^T[out_dim,BT] = B[out_dim,rank] @ h^T[rank,BT]
-    // cuBLAS: M=out_dim, N=BT, K=rank, tA=T(B), tB=F(h)
-    //   A_arg=B_bf16 (rm[out,rank]→cm[rank,out], transT→[out,rank]) lda=rank
-    //   B_arg=h      (rm[BT,rank]→cm[rank,BT],   transF→[rank,BT])  ldb=rank
-    //   C_arg=delta  (rm[BT,out]→cm[out,BT])                         ldc=out_dim
     Tensor delta = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)lp.out_dim}, dev);
     {
         GemmParams p;
@@ -167,8 +139,6 @@ void AdapterModel::apply_lora_bwd(
     float scale = cfg_.alpha / (float)cfg_.rank;
 
     // ── Recompute forward h ───────────────────────────────────
-    // h[BT, rank] = x[BT, in_dim] @ A[rank, in_dim]^T
-    // (same GEMM as fwd — see apply_lora_fwd comment above)
     Tensor h = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)lp.rank}, dev);
     {
         GemmParams p;
@@ -181,7 +151,7 @@ void AdapterModel::apply_lora_bwd(
                   h.bf16(),         lp.rank);
     }
 
-    // ── Promote to F32 for gradient accumulation ─────────────
+    // ── Promote to F32 ───────────────────────────────────────
     Tensor h_f32      = Tensor::empty_f32({(std::size_t)BT, (std::size_t)lp.rank},    dev);
     Tensor go_f32     = Tensor::empty_f32({(std::size_t)BT, (std::size_t)lp.out_dim}, dev);
     Tensor x_f32      = Tensor::empty_f32({(std::size_t)BT, (std::size_t)lp.in_dim},  dev);
@@ -189,32 +159,23 @@ void AdapterModel::apply_lora_bwd(
     ops::cast_bf16_to_f32(grad_out.bf16(),  go_f32.f32(), BT * lp.out_dim, dev.stream());
     ops::cast_bf16_to_f32(x.bf16(),         x_f32.f32(),  BT * lp.in_dim,  dev.stream());
 
-    // ── gB[out_dim, rank] += scale * grad_out[BT,out_dim]^T @ h[BT,rank] ──
-    //
-    // gB^T[rank,out_dim] = scale * h^T[rank,BT]_cm @ grad_out[BT,out_dim]_cm(transB)
-    // cuBLAS: M=rank, N=out_dim, K=BT, tA=F(h), tB=T(go)
-    //   A_arg=h_f32  (rm[BT,rank]→cm[rank,BT],   transF→[rank,BT])   lda=rank
-    //   B_arg=go_f32 (rm[BT,out]→cm[out,BT],     transT→[BT,out])    ldb=out_dim
-    //   C_arg=gB     (rm[out,rank]→cm[rank,out])                       ldc=rank
+    // ── FIX 1: gB[out_dim, rank] ─────────────────────────────
+    // Correct Math: gB = scale * grad_out^T @ h
+    // Target cuBLAS (CM): [rank, out] = [rank, BT] @ [out, BT]^T
+    // => C = A * B^T where A=h_mem, B=go_mem
     {
         GemmParams p;
-        p.transA = false; p.transB = true;
-        p.M = lp.rank;    p.N = lp.out_dim;  p.K = BT;
+        p.transA = false; p.transB = true; 
+        p.M = lp.rank;    p.N = lp.out_dim;  p.K = BT; 
         p.alpha = scale;  p.beta  = 1.f;
+        
         gemm_f32(dev, p,
-                 h_f32.f32(),  lp.rank,
-                 go_f32.f32(), lp.out_dim,
-                 lp.gB.f32(),  lp.rank);
+                 h_f32.f32(),  lp.rank,     // A = h
+                 go_f32.f32(), lp.out_dim,  // B = grad_out
+                 lp.gB.f32(),  lp.rank);    // C = gB
     }
 
     // ── dh[BT, rank] = grad_out[BT, out_dim] @ B[out_dim, rank] ─
-    //
-    // dh^T[rank,BT] = B^T[rank,out_dim]_cm @ grad_out^T[out_dim,BT]_cm
-    // = B[out_dim,rank]_rm_as_cm[rank,out_dim](transF) @ go_cm[out,BT](transF)
-    // cuBLAS: M=rank, N=BT, K=out_dim, tA=F(B), tB=F(go)
-    //   A_arg=B_bf16 (rm[out,rank]→cm[rank,out], transF→[rank,out]) lda=rank
-    //   B_arg=go     (rm[BT,out]→cm[out,BT],     transF→[out,BT])   ldb=out_dim
-    //   C_arg=dh     (rm[BT,rank]→cm[rank,BT])                       ldc=rank
     Tensor dh = Tensor::empty_bf16({(std::size_t)BT, (std::size_t)lp.rank}, dev);
     {
         GemmParams p;
@@ -229,32 +190,23 @@ void AdapterModel::apply_lora_bwd(
     Tensor dh_f32 = Tensor::empty_f32({(std::size_t)BT, (std::size_t)lp.rank}, dev);
     ops::cast_bf16_to_f32(dh.bf16(), dh_f32.f32(), BT * lp.rank, dev.stream());
 
-    // ── gA[rank, in_dim] += scale * dh[BT,rank]^T @ x[BT,in_dim] ──
-    //
-    // gA^T[in_dim,rank] = scale * x^T[in_dim,BT]_cm @ dh[BT,rank]_cm(transB)
-    // cuBLAS: M=in_dim, N=rank, K=BT, tA=F(x), tB=T(dh)
-    //   A_arg=x_f32  (rm[BT,in]→cm[in,BT],   transF→[in,BT])   lda=in_dim
-    //   B_arg=dh_f32 (rm[BT,rank]→cm[rank,BT], transT→[BT,rank]) ldb=rank
-    //   C_arg=gA     (rm[rank,in]→cm[in,rank])                    ldc=in_dim
+    // ── FIX 2: gA[rank, in_dim] ──────────────────────────────
+    // Correct Math: gA = scale * dh^T @ x
+    // Target cuBLAS (CM): [in, rank] = [in, BT] @ [rank, BT]^T
+    // => C = A * B^T where A=x_mem, B=dh_mem
     {
         GemmParams p;
-        p.transA = false;   p.transB = true;
-        p.M = lp.in_dim;    p.N = lp.rank;    p.K = BT;
+        p.transA = false;   p.transB = true; 
+        p.M = lp.in_dim;    p.N = lp.rank;    p.K = BT; 
         p.alpha = scale;    p.beta  = 1.f;
+        
         gemm_f32(dev, p,
-                 x_f32.f32(),   lp.in_dim,
-                 dh_f32.f32(),  lp.rank,
-                 lp.gA.f32(),   lp.in_dim);
+                 x_f32.f32(),   lp.in_dim, // A = x
+                 dh_f32.f32(),  lp.rank,   // B = dh
+                 lp.gA.f32(),   lp.in_dim);// C = gA
     }
 
     // ── grad_x[BT, in_dim] += scale * dh[BT,rank] @ A[rank,in_dim] ──
-    //
-    // grad_x^T[in_dim,BT] = scale * A^T[in_dim,rank]_cm @ dh^T[rank,BT]_cm
-    // = A[rank,in_dim]_rm_as_cm[in,rank](transF) @ dh_cm[rank,BT](transF)
-    // cuBLAS: M=in_dim, N=BT, K=rank, tA=F(A), tB=F(dh)
-    //   A_arg=A_bf16 (rm[rank,in]→cm[in,rank], transF→[in,rank]) lda=in_dim
-    //   B_arg=dh     (rm[BT,rank]→cm[rank,BT], transF→[rank,BT]) ldb=rank
-    //   C_arg=grad_x (rm[BT,in]→cm[in,BT])                        ldc=in_dim
     {
         GemmParams p;
         p.transA = false;  p.transB = false;
